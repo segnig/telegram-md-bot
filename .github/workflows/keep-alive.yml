@@ -1,0 +1,38 @@
+# Pings the Render Free Web Service so it does not sleep after 15 minutes
+# of idle HTTP traffic. Scheduled workflows only run from the default branch.
+name: Keep Render awake
+
+on:
+  schedule:
+    # Every 10 minutes. GitHub may delay cron jobs by a few minutes under load.
+    - cron: "*/10 * * * *"
+  workflow_dispatch: # allow manual runs from the Actions tab
+
+jobs:
+  health-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ping /health
+        env:
+          HEALTH_URL: https://telegram-md-bot.onrender.com/health
+        run: |
+          set -euo pipefail
+          echo "GET $HEALTH_URL"
+          # Free Render cold starts can take ~1 minute after sleep.
+          for attempt in 1 2 3 4 5 6; do
+            if curl -fsS --max-time 30 "$HEALTH_URL" -o /tmp/health-body; then
+              body="$(cat /tmp/health-body)"
+              echo "response: $body"
+              if [ "$body" = "ok" ]; then
+                echo "health check passed"
+                exit 0
+              fi
+              echo "unexpected body, retrying ($attempt/6)"
+            else
+              echo "request failed, retrying ($attempt/6)"
+            fi
+            sleep 10
+          done
+          echo "health check failed after retries"
+          exit 1

@@ -304,9 +304,11 @@ health checks while long-polling Telegram in the background.
 
 - Free web services **sleep after 15 minutes** with no HTTP traffic. While
   asleep, the bot stops polling and will not answer until it wakes up.
-- To keep it awake, ping `https://YOUR-SERVICE.onrender.com/health` every
-  5 minutes with a free monitor such as
-  [UptimeRobot](https://uptimerobot.com/) or [cron-job.org](https://cron-job.org/).
+- This repo includes a GitHub Actions workflow
+  (`.github/workflows/keep-alive.yml`) that pings
+  `https://telegram-md-bot.onrender.com/health` every **10 minutes**. Push it
+  to `main`, then open the **Actions** tab and confirm **Keep Render awake**
+  runs. You can also click **Run workflow** once to test it immediately.
 - Free workspaces get **750 instance hours/month**. One always-on service uses
   about a full month of that budget.
 - Render may restart free services at any time.
@@ -337,8 +339,9 @@ health checks while long-polling Telegram in the background.
 7. Create Web Service and wait until the deploy is **Live**.
 8. Open `https://YOUR-SERVICE.onrender.com/health` — it should return `ok`.
 9. Message the bot on Telegram (`/start` or paste markdown).
-10. **Required for 24/7:** create an UptimeRobot HTTP(s) monitor on
-    `https://YOUR-SERVICE.onrender.com/health` every 5 minutes.
+10. After pushing `.github/workflows/keep-alive.yml` to `main`, check
+    **Actions → Keep Render awake**. GitHub will ping `/health` every 10
+    minutes so the Free service does not sleep.
 
 Or use the included `render.yaml`: Dashboard → **New** → **Blueprint** →
 select the repo, then fill in `TELEGRAM_BOT_TOKEN`.
