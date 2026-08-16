@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -242,6 +243,107 @@ func TestEverythingSampleIsDeliveredInFull(t *testing.T) {
 		if !strings.Contains(delivered, want) {
 			t.Errorf("delivered reply is missing %q", want)
 		}
+	}
+}
+
+func TestImageDownloadIdentifiesItself(t *testing.T) {
+	var agent string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		agent = r.UserAgent()
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(pngPixel)
+	}))
+	defer server.Close()
+
+	if _, err := downloadPhoto(context.Background(), server.URL+"/a.png"); err != nil {
+		t.Fatalf("downloadPhoto() failed: %v", err)
+	}
+	if !strings.Contains(agent, "telegram-md-bot") {
+		t.Errorf("User-Agent = %q, want it to name the bot", agent)
+	}
+}
+
+// svgServer serves SVG at /*.svg and PNG for anything else, standing in for
+// both the origin host and the rasterizer.
+func svgServer(t *testing.T, rasterized *int) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, ".svg") {
+			w.Header().Set("Content-Type", "image/svg+xml")
+			_, _ = w.Write([]byte(`<svg xmlns="http://www.w3.org/2000/svg"/>`))
+			return
+		}
+		if rasterized != nil {
+			*rasterized++
+		}
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(pngPixel)
+	}))
+}
+
+func TestSVGIsRasterizedBeforeUpload(t *testing.T) {
+	rasterized := 0
+	origin := svgServer(t, &rasterized)
+	defer origin.Close()
+
+	t.Setenv("SVG_RENDER_ENDPOINT", origin.URL+"/render?url=")
+	photo, err := fetchImage(context.Background(), origin.URL+"/logo.svg")
+	if err != nil {
+		t.Fatalf("fetchImage() failed: %v", err)
+	}
+	if rasterized != 1 {
+		t.Errorf("rasterizer was called %d times, want 1", rasterized)
+	}
+	if !strings.HasSuffix(photo.Filename, ".png") {
+		t.Errorf("filename = %q, want a .png", photo.Filename)
+	}
+}
+
+func TestSVGRasterizingCanBeDisabled(t *testing.T) {
+	origin := svgServer(t, nil)
+	defer origin.Close()
+
+	t.Setenv("SVG_RENDER_ENDPOINT", "off")
+	_, err := fetchImage(context.Background(), origin.URL+"/logo.svg")
+	if !errors.Is(err, errUnsupportedFormat) {
+		t.Errorf("error = %v, want errUnsupportedFormat", err)
+	}
+}
+
+func TestSVGImageReachesTheAlbum(t *testing.T) {
+	origin := svgServer(t, nil)
+	defer origin.Close()
+	var calls []recordedCall
+	api := telegramServer(t, &calls)
+	defer api.Close()
+
+	t.Setenv("SVG_RENDER_ENDPOINT", origin.URL+"/render?url=")
+	bot := telegram.NewWithAPIBase(api.URL, "token")
+	handleMessage(context.Background(), bot, &telegram.Message{
+		Text: "![logo](" + origin.URL + "/logo.svg)",
+		Chat: telegram.Chat{ID: 1},
+	})
+
+	if len(calls) != 1 {
+		t.Fatalf("got %d calls, want 1: %#v", len(calls), calls)
+	}
+	if calls[0].path != "/sendPhoto" || calls[0].files != 1 {
+		t.Errorf("SVG did not become an attachment: %#v", calls[0])
+	}
+}
+
+func TestSVGEndpointDefaultsAndOverrides(t *testing.T) {
+	t.Setenv("SVG_RENDER_ENDPOINT", "")
+	if got := svgEndpoint(); got != defaultSVGEndpoint {
+		t.Errorf("svgEndpoint() = %q, want the default", got)
+	}
+	t.Setenv("SVG_RENDER_ENDPOINT", "https://svg.internal/?url=")
+	if got := svgEndpoint(); got != "https://svg.internal/?url=" {
+		t.Errorf("svgEndpoint() = %q, want the override", got)
+	}
+	t.Setenv("SVG_RENDER_ENDPOINT", "off")
+	if got := svgEndpoint(); got != "" {
+		t.Errorf("svgEndpoint() = %q, want empty when disabled", got)
 	}
 }
 

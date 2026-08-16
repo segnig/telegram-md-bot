@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"regexp"
@@ -28,6 +29,12 @@ const (
 	maxAlbumPhotos     = 10
 	maxPhotoBytes      = 10 << 20
 	photoFetchTimeout  = 30 * time.Second
+	// Several image hosts, Wikimedia among them, refuse requests that do not
+	// identify the client.
+	userAgent = "telegram-md-bot/1.0 (Markdown to Telegram MarkdownV2 bot)"
+	// Telegram will not accept SVG as a photo, so such images are fetched
+	// through a rasterizer that returns PNG.
+	defaultSVGEndpoint = "https://images.weserv.nl/?output=png&w=1024&url="
 )
 
 const welcomeText = "Send me CommonMark or GitHub-Flavored Markdown and I'll convert it to Telegram MarkdownV2.\n\n" +
@@ -200,7 +207,7 @@ func collectPhotos(ctx context.Context, markdown string) collectedMedia {
 		if len(photos) >= maxAlbumPhotos {
 			break
 		}
-		photo, err := downloadPhoto(ctx, image.URL)
+		photo, err := fetchImage(ctx, image.URL)
 		if err != nil {
 			log.Printf("skipping image %q: %v", image.URL, err)
 			continue
@@ -230,6 +237,28 @@ func collectPhotos(ctx context.Context, markdown string) collectedMedia {
 	return collectedMedia{Photos: photos, MermaidAttached: attached}
 }
 
+// errUnsupportedFormat marks an image Telegram will not accept as a photo.
+var errUnsupportedFormat = errors.New("unsupported image format")
+
+// fetchImage downloads an image, rasterizing formats Telegram rejects as
+// photos. SVG is the common case: the Bot API refuses it outright, so without
+// this an SVG in the markdown would simply go missing from the reply.
+func fetchImage(ctx context.Context, imageURL string) (telegram.InputPhoto, error) {
+	photo, err := downloadPhoto(ctx, imageURL)
+	if !errors.Is(err, errUnsupportedFormat) {
+		return photo, err
+	}
+	endpoint := svgEndpoint()
+	if endpoint == "" {
+		return telegram.InputPhoto{}, err
+	}
+	rasterized, rasterErr := downloadPhoto(ctx, endpoint+url.QueryEscape(imageURL))
+	if rasterErr != nil {
+		return telegram.InputPhoto{}, fmt.Errorf("%w (rasterizing also failed: %v)", err, rasterErr)
+	}
+	return rasterized, nil
+}
+
 func downloadPhoto(ctx context.Context, url string) (telegram.InputPhoto, error) {
 	ctx, cancel := context.WithTimeout(ctx, photoFetchTimeout)
 	defer cancel()
@@ -238,6 +267,10 @@ func downloadPhoto(ctx context.Context, url string) (telegram.InputPhoto, error)
 	if err != nil {
 		return telegram.InputPhoto{}, err
 	}
+	// Wikimedia and others answer 403 to the default Go user agent, so the
+	// bot identifies itself.
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Accept", "image/*")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return telegram.InputPhoto{}, err
@@ -249,7 +282,8 @@ func downloadPhoto(ctx context.Context, url string) (telegram.InputPhoto, error)
 	}
 	extension, ok := photoExtension(resp.Header.Get("Content-Type"))
 	if !ok {
-		return telegram.InputPhoto{}, fmt.Errorf("unsupported content type %q", resp.Header.Get("Content-Type"))
+		return telegram.InputPhoto{}, fmt.Errorf("%w: content type %q",
+			errUnsupportedFormat, resp.Header.Get("Content-Type"))
 	}
 
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxPhotoBytes+1))
@@ -279,6 +313,21 @@ func photoExtension(contentType string) (string, bool) {
 		return ".bmp", true
 	default:
 		return "", false
+	}
+}
+
+// svgEndpoint returns the rasterizer that converts formats Telegram rejects
+// into PNG. Set SVG_RENDER_ENDPOINT to a self-hosted service, or to "off" to
+// skip such images instead of sending their URL to a third party.
+func svgEndpoint() string {
+	endpoint := strings.TrimSpace(os.Getenv("SVG_RENDER_ENDPOINT"))
+	switch endpoint {
+	case "":
+		return defaultSVGEndpoint
+	case "off":
+		return ""
+	default:
+		return endpoint
 	}
 }
 

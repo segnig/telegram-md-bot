@@ -131,7 +131,20 @@ Telegram imposes limits that shape this behavior:
 - A single image uses `sendPhoto`, which is genuinely one message. Several
   images use `sendMediaGroup`, which Telegram delivers as one album.
 - Up to 10 images are attached per reply, each at most 10 MB.
-- SVG images are skipped, since the Bot API rejects them as photos.
+- Image downloads identify the bot with a `User-Agent`, since hosts such as
+  Wikimedia answer `403` to unidentified clients.
+
+### SVG images
+
+The Bot API refuses SVG as a photo, so an SVG is fetched through a rasterizer
+that returns PNG. This uses the public [images.weserv.nl](https://images.weserv.nl)
+proxy by default, which means the image URL (not your content) is sent there.
+Point it elsewhere, or turn it off and skip such images entirely:
+
+```bash
+export SVG_RENDER_ENDPOINT="https://images.internal.example.com/?url="
+export SVG_RENDER_ENDPOINT=off
+```
 
 ### Long documents
 
