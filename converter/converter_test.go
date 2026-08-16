@@ -102,3 +102,49 @@ func TestTable(t *testing.T) {
 		t.Errorf("table content missing, got %q", got)
 	}
 }
+
+func TestNestedEmphasis(t *testing.T) {
+	got := Convert("**bold and *italic* together**")
+	want := "*bold and _italic_ together*"
+	if got != want {
+		t.Errorf("got %q want %q", got, want)
+	}
+}
+
+func TestTaskList(t *testing.T) {
+	got := Convert("- [x] shipped\n- [ ] pending")
+	want := "• ☑ shipped\n• ☐ pending"
+	if got != want {
+		t.Errorf("got %q want %q", got, want)
+	}
+}
+
+func TestNestedList(t *testing.T) {
+	got := Convert("- parent\n  1. child")
+	want := "• parent\n  1\\. child"
+	if got != want {
+		t.Errorf("got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestUnicodeTableAlignment(t *testing.T) {
+	got := Convert("| Name | City |\n|---|---|\n| José | 東京 |")
+	if !strings.Contains(got, "José") || !strings.Contains(got, "東京") {
+		t.Errorf("Unicode table content missing, got %q", got)
+	}
+}
+
+func TestRawHTMLRenderedAsText(t *testing.T) {
+	got := Convert("<strong>unsafe</strong>")
+	if got != `<strong\>unsafe</strong\>` {
+		t.Errorf("expected raw HTML to remain literal text, got %q", got)
+	}
+}
+
+func TestWindowsLineEndings(t *testing.T) {
+	got := Convert("first\r\n\r\nsecond")
+	want := "first\n\nsecond"
+	if got != want {
+		t.Errorf("got %q want %q", got, want)
+	}
+}

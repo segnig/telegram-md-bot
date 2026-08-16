@@ -1,336 +1,314 @@
-// Package converter turns standard Markdown (CommonMark-ish) into text
-// formatted for Telegram's MarkdownV2 parse mode.
-//
-// Telegram's MarkdownV2 is NOT the same as normal Markdown:
-//   - Bold is *single asterisks*, not **double**.
-//   - Italic is _single underscores_.
-//   - There are no headers, tables, images-as-images, or <hr>; those get
-//     converted to the closest Telegram-friendly equivalent.
-//   - A long list of characters must be backslash-escaped anywhere they
-//     appear as literal text: _ * [ ] ( ) ~ ` > # + - = | { } . ! and \
-//
-// This package walks the input line by line for block-level constructs
-// (headers, lists, blockquotes, code fences, tables, horizontal rules)
-// and does a placeholder-based inline pass for span-level constructs
-// (bold, italic, strikethrough, inline code, links, images).
+// Package converter turns CommonMark Markdown into Telegram MarkdownV2.
 package converter
 
 import (
 	"fmt"
-	"regexp"
-	"strconv"
 	"strings"
+	"unicode/utf8"
+
+	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/ast"
+	"github.com/yuin/goldmark/extension"
+	extensionast "github.com/yuin/goldmark/extension/ast"
+	"github.com/yuin/goldmark/parser"
+	"github.com/yuin/goldmark/text"
 )
 
-// reservedChars are the characters MarkdownV2 requires to be escaped
-// wherever they appear as literal (non-formatting) text.
 const reservedChars = "_*[]()~`>#+-=|{}.!\\"
 
-// Convert transforms markdown into Telegram MarkdownV2-ready text.
-func Convert(md string) string {
-	// Normalize line endings.
-	md = strings.ReplaceAll(md, "\r\n", "\n")
-	lines := strings.Split(md, "\n")
-
-	var out []string
-
-	inCode := false
-	codeLang := ""
-	var codeBuf []string
-
-	inTable := false
-	var tableBuf []string
-
-	flushTable := func() {
-		if len(tableBuf) > 0 {
-			if rendered := renderTable(tableBuf); rendered != "" {
-				out = append(out, rendered)
-			}
-		}
-		tableBuf = nil
-		inTable = false
-	}
-
-	fenceRe := regexp.MustCompile("^```\\s*([a-zA-Z0-9_+-]*)\\s*$")
-	headerRe := regexp.MustCompile(`^(#{1,6})\s+(.*)$`)
-	hrRe := regexp.MustCompile(`^(-{3,}|\*{3,}|_{3,})$`)
-	quoteRe := regexp.MustCompile(`^>\s?(.*)$`)
-	ulRe := regexp.MustCompile(`^(\s*)[-*+]\s+(.*)$`)
-	olRe := regexp.MustCompile(`^(\s*)(\d+)[.)]\s+(.*)$`)
-
-	for _, raw := range lines {
-		line := raw
-		trimmed := strings.TrimSpace(line)
-
-		// --- code fences ---
-		if m := fenceRe.FindStringSubmatch(trimmed); m != nil {
-			if !inCode {
-				inCode = true
-				codeLang = m[1]
-				codeBuf = nil
-			} else {
-				inCode = false
-				out = append(out, renderCodeBlock(codeLang, codeBuf))
-			}
-			continue
-		}
-		if inCode {
-			codeBuf = append(codeBuf, line)
-			continue
-		}
-
-		// --- tables (must contain a pipe) ---
-		if strings.Contains(trimmed, "|") && looksLikeTableRow(trimmed) {
-			inTable = true
-			tableBuf = append(tableBuf, trimmed)
-			continue
-		} else if inTable {
-			flushTable()
-		}
-
-		// --- horizontal rule ---
-		if hrRe.MatchString(trimmed) {
-			out = append(out, "──────────")
-			continue
-		}
-
-		// --- headers -> bold line ---
-		if m := headerRe.FindStringSubmatch(trimmed); m != nil {
-			content := inlineConvert(m[2])
-			out = append(out, "*"+content+"*")
-			continue
-		}
-
-		// --- blockquote ---
-		if m := quoteRe.FindStringSubmatch(trimmed); m != nil {
-			out = append(out, "> "+inlineConvert(m[1]))
-			continue
-		}
-
-		// --- unordered list ---
-		if m := ulRe.FindStringSubmatch(line); m != nil {
-			indent := m[1]
-			content := inlineConvert(m[2])
-			out = append(out, indent+"• "+content)
-			continue
-		}
-
-		// --- ordered list ---
-		if m := olRe.FindStringSubmatch(line); m != nil {
-			indent, num, content := m[1], m[2], inlineConvert(m[3])
-			out = append(out, indent+num+"\\. "+content)
-			continue
-		}
-
-		if trimmed == "" {
-			out = append(out, "")
-			continue
-		}
-
-		// --- plain paragraph line ---
-		out = append(out, inlineConvert(line))
-	}
-
-	if inTable {
-		flushTable()
-	}
-	if inCode {
-		// Unterminated fence: close it gracefully.
-		out = append(out, renderCodeBlock(codeLang, codeBuf))
-	}
-
-	return strings.Join(out, "\n")
-}
-
-// ---------- inline (span-level) handling ----------
-
-var (
-	codeSpanRe  = regexp.MustCompile("`([^`]+)`")
-	imageRe     = regexp.MustCompile(`!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)`)
-	linkRe      = regexp.MustCompile(`\[([^\]]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)`)
-	boldRe      = regexp.MustCompile(`\*\*([^*]+)\*\*|__([^_]+)__`)
-	strikeRe    = regexp.MustCompile(`~~([^~]+)~~`)
-	italicRe    = regexp.MustCompile(`\*([^*]+)\*|_([^_]+)_`)
-	placeholdRe = regexp.MustCompile("\x00(\\d+)\x00")
+var markdown = goldmark.New(
+	goldmark.WithExtensions(extension.GFM),
+	goldmark.WithParserOptions(parser.WithAutoHeadingID()),
 )
 
-// inlineConvert applies span-level markdown -> MarkdownV2 conversion and
-// escapes any remaining literal text.
-func inlineConvert(s string) string {
-	var placeholders []string
-	store := func(rendered string) string {
-		placeholders = append(placeholders, rendered)
-		return fmt.Sprintf("\x00%d\x00", len(placeholders)-1)
+// Convert transforms CommonMark/GFM input into Telegram MarkdownV2-ready text.
+func Convert(md string) string {
+	source := []byte(strings.ReplaceAll(md, "\r\n", "\n"))
+	doc := markdown.Parser().Parse(text.NewReader(source))
+	r := renderer{source: source}
+	return strings.TrimRight(r.renderBlocks(doc.FirstChild(), 0), "\n")
+}
+
+type renderer struct {
+	source []byte
+}
+
+func (r renderer) renderBlocks(node ast.Node, depth int) string {
+	var out strings.Builder
+	for n := node; n != nil; n = n.NextSibling() {
+		switch n := n.(type) {
+		case *ast.Heading:
+			out.WriteString("*")
+			out.WriteString(r.renderInlineChildren(n))
+			out.WriteString("*\n\n")
+		case *ast.Paragraph, *ast.TextBlock:
+			out.WriteString(r.renderInlineChildren(n))
+			out.WriteString("\n\n")
+		case *ast.Blockquote:
+			content := strings.TrimSpace(r.renderBlocks(n.FirstChild(), depth))
+			for _, line := range strings.Split(content, "\n") {
+				if line == "" {
+					out.WriteString(">\n")
+				} else {
+					out.WriteString("> ")
+					out.WriteString(line)
+					out.WriteByte('\n')
+				}
+			}
+			out.WriteByte('\n')
+		case *ast.List:
+			out.WriteString(r.renderList(n, depth))
+			if depth == 0 {
+				out.WriteByte('\n')
+			}
+		case *ast.FencedCodeBlock:
+			out.WriteString(r.renderFencedCode(n))
+			out.WriteString("\n\n")
+		case *ast.CodeBlock:
+			out.WriteString(r.renderCodeLines(n.Lines()))
+			out.WriteString("\n\n")
+		case *ast.ThematicBreak:
+			out.WriteString("──────────\n\n")
+		case *extensionast.Table:
+			out.WriteString(r.renderTable(n))
+			out.WriteString("\n\n")
+		case *ast.HTMLBlock:
+			out.WriteString(escapeText(r.blockLines(n.Lines())))
+			out.WriteString("\n\n")
+		default:
+			if n.HasChildren() {
+				out.WriteString(r.renderBlocks(n.FirstChild(), depth))
+			}
+		}
 	}
+	return out.String()
+}
 
-	// 1. Protect inline code spans first so nothing inside them gets
-	//    reinterpreted as formatting.
-	s = codeSpanRe.ReplaceAllStringFunc(s, func(m string) string {
-		inner := codeSpanRe.FindStringSubmatch(m)[1]
-		return store("`" + escapeCode(inner) + "`")
-	})
+func (r renderer) renderList(list *ast.List, depth int) string {
+	var out strings.Builder
+	index := list.Start
+	for item := list.FirstChild(); item != nil; item = item.NextSibling() {
+		if item.Kind() != ast.KindListItem {
+			continue
+		}
+		prefix := "• "
+		if list.IsOrdered() {
+			prefix = fmt.Sprintf("%d\\. ", index)
+			index++
+		}
+		indent := strings.Repeat("  ", depth)
+		out.WriteString(indent)
+		out.WriteString(prefix)
 
-	// 2. Images -> "📷 alt" link.
-	s = imageRe.ReplaceAllStringFunc(s, func(m string) string {
-		sub := imageRe.FindStringSubmatch(m)
-		alt, url := sub[1], sub[2]
+		first := true
+		for child := item.FirstChild(); child != nil; child = child.NextSibling() {
+			if nested, ok := child.(*ast.List); ok {
+				if first {
+					out.WriteByte('\n')
+				}
+				out.WriteString(r.renderList(nested, depth+1))
+				first = false
+				continue
+			}
+			content := strings.TrimSpace(r.renderBlockNode(child, depth+1))
+			if content == "" {
+				continue
+			}
+			if !first {
+				out.WriteString(indent)
+				out.WriteString("  ")
+			}
+			out.WriteString(strings.ReplaceAll(content, "\n", "\n"+indent+"  "))
+			out.WriteByte('\n')
+			first = false
+		}
+		if first {
+			out.WriteByte('\n')
+		}
+	}
+	return out.String()
+}
+
+func (r renderer) renderBlockNode(n ast.Node, depth int) string {
+	switch n := n.(type) {
+	case *ast.Paragraph, *ast.TextBlock:
+		return r.renderInlineChildren(n)
+	case *ast.Blockquote:
+		return strings.TrimSpace(r.renderBlocks(n, depth))
+	default:
+		if n.HasChildren() {
+			return strings.TrimSpace(r.renderBlocks(n.FirstChild(), depth))
+		}
+	}
+	return ""
+}
+
+func (r renderer) renderInlineChildren(parent ast.Node) string {
+	var out strings.Builder
+	for child := parent.FirstChild(); child != nil; child = child.NextSibling() {
+		out.WriteString(r.renderInline(child))
+	}
+	return out.String()
+}
+
+func (r renderer) renderInline(n ast.Node) string {
+	switch n := n.(type) {
+	case *ast.Text:
+		value := string(n.Segment.Value(r.source))
+		if n.SoftLineBreak() || n.HardLineBreak() {
+			value += "\n"
+		}
+		return escapeText(value)
+	case *ast.String:
+		return escapeText(string(n.Value))
+	case *ast.Emphasis:
+		content := r.renderInlineChildren(n)
+		if n.Level == 2 {
+			return "*" + content + "*"
+		}
+		return "_" + content + "_"
+	case *ast.CodeSpan:
+		return "`" + escapeCode(string(n.Text(r.source))) + "`"
+	case *ast.Link:
+		return "[" + r.renderInlineChildren(n) + "](" + escapeURL(string(n.Destination)) + ")"
+	case *ast.Image:
+		alt := plainText(n, r.source)
 		if alt == "" {
 			alt = "image"
 		}
-		return store("[📷 " + escapeText(alt) + "](" + escapeURL(url) + ")")
-	})
-
-	// 3. Links.
-	s = linkRe.ReplaceAllStringFunc(s, func(m string) string {
-		sub := linkRe.FindStringSubmatch(m)
-		text, url := sub[1], sub[2]
-		return store("[" + escapeText(text) + "](" + escapeURL(url) + ")")
-	})
-
-	// 4. Bold (**x** or __x__) — must run before italic.
-	s = boldRe.ReplaceAllStringFunc(s, func(m string) string {
-		sub := boldRe.FindStringSubmatch(m)
-		inner := sub[1]
-		if inner == "" {
-			inner = sub[2]
+		return "[📷 " + escapeText(alt) + "](" + escapeURL(string(n.Destination)) + ")"
+	case *ast.AutoLink:
+		url := string(n.URL(r.source))
+		return "[" + escapeText(string(n.Label(r.source))) + "](" + escapeURL(url) + ")"
+	case *ast.RawHTML:
+		var value strings.Builder
+		for i := 0; i < n.Segments.Len(); i++ {
+			segment := n.Segments.At(i)
+			value.Write(segment.Value(r.source))
 		}
-		return store("*" + escapeText(inner) + "*")
-	})
-
-	// 5. Strikethrough.
-	s = strikeRe.ReplaceAllStringFunc(s, func(m string) string {
-		inner := strikeRe.FindStringSubmatch(m)[1]
-		return store("~" + escapeText(inner) + "~")
-	})
-
-	// 6. Italic (*x* or _x_).
-	s = italicRe.ReplaceAllStringFunc(s, func(m string) string {
-		sub := italicRe.FindStringSubmatch(m)
-		inner := sub[1]
-		if inner == "" {
-			inner = sub[2]
+		return escapeText(value.String())
+	case *extensionast.Strikethrough:
+		return "~" + r.renderInlineChildren(n) + "~"
+	case *extensionast.TaskCheckBox:
+		if n.IsChecked {
+			return "☑ "
 		}
-		return store("_" + escapeText(inner) + "_")
-	})
-
-	// 7. Escape whatever plain text remains.
-	s = escapeText(s)
-
-	// 8. Restore placeholders (already-rendered, already-escaped segments).
-	s = placeholdRe.ReplaceAllStringFunc(s, func(m string) string {
-		idx, _ := strconv.Atoi(placeholdRe.FindStringSubmatch(m)[1])
-		return placeholders[idx]
-	})
-
-	return s
-}
-
-// escapeText escapes every MarkdownV2 reserved character in plain text.
-func escapeText(s string) string {
-	var b strings.Builder
-	b.Grow(len(s) + 8)
-	for _, r := range s {
-		if strings.ContainsRune(reservedChars, r) {
-			b.WriteByte('\\')
+		return "☐ "
+	default:
+		if n.HasChildren() {
+			return r.renderInlineChildren(n)
 		}
-		b.WriteRune(r)
 	}
-	return b.String()
+	return ""
 }
 
-// escapeCode escapes text that will live inside a `code` span or ```block```,
-// where only backslash and backtick are special.
-func escapeCode(s string) string {
-	s = strings.ReplaceAll(s, `\`, `\\`)
-	s = strings.ReplaceAll(s, "`", "\\`")
-	return s
+func (r renderer) renderFencedCode(n *ast.FencedCodeBlock) string {
+	lang := strings.TrimSpace(string(n.Language(r.source)))
+	content := strings.TrimSuffix(r.blockLines(n.Lines()), "\n")
+	return "```" + escapeCode(lang) + "\n" + escapeCode(content) + "\n```"
 }
 
-// escapeURL escapes text inside a link's (url), where only backslash and
-// close-paren are special.
-func escapeURL(s string) string {
-	s = strings.ReplaceAll(s, `\`, `\\`)
-	s = strings.ReplaceAll(s, `)`, `\)`)
-	return s
+func (r renderer) renderCodeLines(lines *text.Segments) string {
+	content := strings.TrimSuffix(r.blockLines(lines), "\n")
+	return "```\n" + escapeCode(content) + "\n```"
 }
 
-func renderCodeBlock(lang string, lines []string) string {
-	content := escapeCode(strings.Join(lines, "\n"))
-	return "```" + lang + "\n" + content + "\n```"
+func (r renderer) blockLines(lines *text.Segments) string {
+	var out strings.Builder
+	for i := 0; i < lines.Len(); i++ {
+		segment := lines.At(i)
+		out.Write(segment.Value(r.source))
+	}
+	return out.String()
 }
 
-// ---------- tables ----------
-
-var tableSepRe = regexp.MustCompile(`^\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?$`)
-
-func looksLikeTableRow(s string) bool {
-	// A real row has at least one pipe not at the very edges being the
-	// only content, and isn't a lone stray "|" in prose. Heuristic: at
-	// least 2 pipe-separated cells.
-	trimmed := strings.Trim(s, "|")
-	return strings.Contains(trimmed, "|") || tableSepRe.MatchString(s)
-}
-
-func isTableSeparator(s string) bool {
-	return tableSepRe.MatchString(s)
-}
-
-// renderTable renders buffered "| a | b |" rows as a fixed-width block
-// wrapped in a MarkdownV2 pre block, since Telegram has no native tables.
-func renderTable(rows []string) string {
-	var parsed [][]string
-	for _, r := range rows {
-		if isTableSeparator(r) {
+func (r renderer) renderTable(table *extensionast.Table) string {
+	var rows [][]string
+	for row := table.FirstChild(); row != nil; row = row.NextSibling() {
+		if row.Kind() != extensionast.KindTableHeader && row.Kind() != extensionast.KindTableRow {
 			continue
 		}
-		cells := strings.Split(strings.Trim(r, "|"), "|")
-		for i := range cells {
-			cells[i] = strings.TrimSpace(cells[i])
+		var cells []string
+		for cell := row.FirstChild(); cell != nil; cell = cell.NextSibling() {
+			cells = append(cells, plainText(cell, r.source))
 		}
-		parsed = append(parsed, cells)
+		rows = append(rows, cells)
 	}
-	if len(parsed) == 0 {
+	if len(rows) == 0 {
 		return ""
 	}
 
-	numCols := 0
-	for _, row := range parsed {
-		if len(row) > numCols {
-			numCols = len(row)
+	columns := 0
+	for _, row := range rows {
+		if len(row) > columns {
+			columns = len(row)
 		}
 	}
-	widths := make([]int, numCols)
-	for _, row := range parsed {
-		for i, c := range row {
-			if len([]rune(c)) > widths[i] {
-				widths[i] = len([]rune(c))
+	widths := make([]int, columns)
+	for _, row := range rows {
+		for i, cell := range row {
+			width := utf8.RuneCountInString(cell)
+			if width > widths[i] {
+				widths[i] = width
 			}
 		}
 	}
 
-	var b strings.Builder
-	for _, row := range parsed {
-		for i := 0; i < numCols; i++ {
+	var out strings.Builder
+	for _, row := range rows {
+		for i := 0; i < columns; i++ {
 			cell := ""
 			if i < len(row) {
 				cell = row[i]
 			}
-			b.WriteString(padRight(cell, widths[i]))
-			if i < numCols-1 {
-				b.WriteString(" | ")
+			out.WriteString(cell)
+			out.WriteString(strings.Repeat(" ", widths[i]-utf8.RuneCountInString(cell)))
+			if i < columns-1 {
+				out.WriteString(" | ")
 			}
 		}
-		b.WriteString("\n")
+		out.WriteByte('\n')
 	}
-
-	content := escapeCode(strings.TrimRight(b.String(), "\n"))
-	return "```\n" + content + "\n```"
+	return "```\n" + escapeCode(strings.TrimSuffix(out.String(), "\n")) + "\n```"
 }
 
-func padRight(s string, width int) string {
-	diff := width - len([]rune(s))
-	if diff <= 0 {
-		return s
+func plainText(n ast.Node, source []byte) string {
+	var out strings.Builder
+	_ = ast.Walk(n, func(node ast.Node, entering bool) (ast.WalkStatus, error) {
+		if !entering {
+			return ast.WalkContinue, nil
+		}
+		switch node := node.(type) {
+		case *ast.Text:
+			out.Write(node.Segment.Value(source))
+		case *ast.String:
+			out.Write(node.Value)
+		case *ast.CodeSpan:
+			out.Write(node.Text(source))
+		}
+		return ast.WalkContinue, nil
+	})
+	return strings.TrimSpace(out.String())
+}
+
+func escapeText(s string) string {
+	var out strings.Builder
+	out.Grow(len(s) + 8)
+	for _, char := range s {
+		if strings.ContainsRune(reservedChars, char) {
+			out.WriteByte('\\')
+		}
+		out.WriteRune(char)
 	}
-	return s + strings.Repeat(" ", diff)
+	return out.String()
+}
+
+func escapeCode(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	return strings.ReplaceAll(s, "`", "\\`")
+}
+
+func escapeURL(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	return strings.ReplaceAll(s, `)`, `\)`)
 }

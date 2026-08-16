@@ -1,16 +1,17 @@
 # telegram-md-bot
 
-A Telegram bot, written in Go, that converts standard Markdown into
+A Telegram bot, written in Go, that converts CommonMark and
+GitHub-Flavored Markdown into
 Telegram's **MarkdownV2** formatting. Send it any markdown and it replies
 with:
 
 1. a live preview of how the text will render in Telegram, and
-2. the raw converted MarkdownV2 source in a copyable code block, ready to
+2. the raw converted MarkdownV2 source as copyable plain text, ready to
    paste into your own bot's `sendMessage` calls.
 
-No external Go dependencies — the Telegram API client and the converter
-are both built on the standard library only, so `go build` works offline
-once the module is on disk.
+The converter uses [goldmark](https://github.com/yuin/goldmark), a
+CommonMark-compliant parser, instead of regular-expression parsing. The
+Telegram API client itself uses only the Go standard library.
 
 ## What it converts
 
@@ -23,6 +24,7 @@ once the module is on disk.
 | ` ```lang ... ``` `      | fenced code block, preserved as-is                   |
 | `# / ## / ...` headers   | `*bold line*` (Telegram has no header entity)        |
 | `- item` / `1. item`     | `• item` / `1\. item`                                |
+| `- [x] task`             | `• ☑ task`                                            |
 | `> quote`                | `> quote` (Telegram's native blockquote entity)      |
 | `[text](url)`            | `[text](url)`, with escaping inside                  |
 | `![alt](url)`            | `[📷 alt](url)` (Telegram has no inline images)      |
@@ -33,17 +35,18 @@ All literal punctuation that MarkdownV2 treats as special
 (`_ * [ ] ( ) ~ \` > # + - = | { } . !` and `\`) is automatically
 backslash-escaped in plain text, per Telegram's spec.
 
-### Known limitations
+Nested and mixed emphasis is parsed recursively, and GFM task lists and
+tables are supported.
 
-- Nested/mixed emphasis (e.g. `**bold *and italic* together**`) isn't
-  parsed recursively — treat that as a stretch case.
-- Link/image URLs containing an unescaped `)` inside the URL itself (e.g.
-  `https://example.com/path_(x)`) are ambiguous in standard Markdown too;
-  escape it as `\)` in your source or wrap the URL in `<angle brackets>`
-  if you hit this.
-- Table-row detection is heuristic (any line with `|` in it while inside a
-  block of such lines); a stray `|` in prose could be misread as a table
-  row.
+### Reliability behavior
+
+- Long input is split at paragraph boundaries before conversion.
+- Telegram rate limits (`retry_after`) are honored and retried once.
+- Polling failures use bounded exponential backoff.
+- `SIGINT` and `SIGTERM` cancel in-flight HTTP requests and shut down cleanly.
+- Messages, edited messages, and channel posts are accepted.
+- Telegram API errors are returned as typed errors with their error code and
+  retry delay.
 
 ## Project layout
 
@@ -51,11 +54,13 @@ backslash-escaped in plain text, per Telegram's spec.
 telegram-md-bot/
 ├── go.mod
 ├── main.go                 # bot entrypoint: long-polls Telegram, replies
+├── main_test.go
 ├── converter/
-│   ├── converter.go         # the markdown -> MarkdownV2 conversion logic
+│   ├── converter.go         # CommonMark AST -> MarkdownV2 renderer
 │   └── converter_test.go
 └── telegram/
-    └── client.go             # minimal getUpdates / sendMessage client
+    ├── client.go             # context-aware Telegram API client
+    └── client_test.go
 ```
 
 ## 1. Create the bot
@@ -92,6 +97,8 @@ GOOS=linux GOARCH=amd64 go build -o telegram-md-bot-linux .
 
 ```bash
 go test ./...
+go test -race ./...
+go vet ./...
 ```
 
 ## 5. Deploy (simple systemd example)
