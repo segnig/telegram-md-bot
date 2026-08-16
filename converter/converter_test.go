@@ -244,6 +244,33 @@ func TestIsLinkableURL(t *testing.T) {
 	}
 }
 
+func TestMermaidPlaceholderReplacesAttachedDiagram(t *testing.T) {
+	md := "## Diagram\n\ngraph TD\nA-->B\n\nDone"
+	got := ConvertMermaid(md, []bool{true})
+	if strings.Contains(got, "graph TD") || strings.Contains(got, "A-->B") {
+		t.Fatalf("diagram source still present: %q", got)
+	}
+	if !strings.Contains(got, `mermaid\-1\.jpg`) || !strings.Contains(got, `attached image`) {
+		t.Errorf("placeholder missing, got %q", got)
+	}
+}
+
+func TestMermaidPlaceholderSkipsUnattached(t *testing.T) {
+	md := "graph TD\nA-->B"
+	got := ConvertMermaid(md, []bool{false})
+	if !strings.Contains(got, "graph TD") {
+		t.Errorf("unattached diagram should remain as text, got %q", got)
+	}
+}
+
+func TestMermaidPlaceholderNumbersMultiple(t *testing.T) {
+	md := "```mermaid\ngraph TD\nA-->B\n```\n\n```mermaid\nsequenceDiagram\nAlice->>Bob: Hi\n```"
+	got := ConvertMermaid(md, []bool{true, true})
+	if !strings.Contains(got, `mermaid\-1\.jpg`) || !strings.Contains(got, `mermaid\-2\.jpg`) {
+		t.Errorf("expected numbered placeholders, got %q", got)
+	}
+}
+
 func TestExtractMermaidFromFence(t *testing.T) {
 	md := "text\n\n```mermaid\ngraph TD\nA-->B\n```\n\n```go\nfmt.Println(1)\n```"
 	got := ExtractMermaid(md)

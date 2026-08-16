@@ -111,6 +111,12 @@ func TestMermaidReplyIsSingleAttachedMessage(t *testing.T) {
 	if calls[0].mode != "MarkdownV2" || !strings.Contains(calls[0].caption, "*Diagram*") {
 		t.Errorf("unexpected caption %q (mode %q)", calls[0].caption, calls[0].mode)
 	}
+	if strings.Contains(calls[0].caption, "graph TD") {
+		t.Errorf("mermaid source should be replaced by placeholder, got %q", calls[0].caption)
+	}
+	if !strings.Contains(calls[0].caption, `mermaid\-1`) || !strings.Contains(calls[0].caption, "attached image") {
+		t.Errorf("mermaid placeholder missing from caption %q", calls[0].caption)
+	}
 }
 
 func TestMultipleImagesBecomeSingleAlbum(t *testing.T) {

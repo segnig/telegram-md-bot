@@ -58,11 +58,13 @@ Mermaid diagrams are detected in two forms: fenced blocks tagged
 ` ```mermaid `, and unfenced paragraphs that start with a diagram
 declaration such as `graph TD`, `sequenceDiagram`, or `gantt`.
 
-Each diagram is base64url-encoded into a rendering URL, downloaded, and
-uploaded to Telegram as an attachment. Rendering uses the public
-[mermaid.ink](https://mermaid.ink) service by default, which means diagram
-source leaves your machine. Point `MERMAID_ENDPOINT` at a self-hosted
-renderer to avoid that:
+Each successfully rendered Mermaid diagram is uploaded as an attachment named
+`mermaid-N.jpg`, and the diagram source in the reply text is replaced with a
+placeholder such as `📎 mermaid-1.jpg (attached image)`.
+
+Rendering uses the public [mermaid.ink](https://mermaid.ink) service by
+default, which means diagram source leaves your machine. Point
+`MERMAID_ENDPOINT` at a self-hosted renderer to avoid that:
 
 ```bash
 export MERMAID_ENDPOINT="https://mermaid.internal.example.com/img/"

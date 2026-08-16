@@ -32,10 +32,29 @@ type Image struct {
 
 // Convert transforms CommonMark/GFM input into Telegram MarkdownV2-ready text.
 func Convert(md string) string {
+	return ConvertMermaid(md, nil)
+}
+
+// ConvertMermaid is like Convert, but replaces Mermaid diagrams that were
+// successfully attached with a short placeholder naming the attached file.
+// mermaidAttached is parallel to ExtractMermaid: true means that diagram was
+// uploaded and should not appear as raw diagram source in the reply text.
+func ConvertMermaid(md string, mermaidAttached []bool) string {
 	source := []byte(strings.ReplaceAll(md, "\r\n", "\n"))
 	doc := markdown.Parser().Parse(text.NewReader(source))
-	r := renderer{source: source}
+	seen := 0
+	r := renderer{
+		source:          source,
+		mermaidAttached: mermaidAttached,
+		mermaidSeen:     &seen,
+	}
 	return strings.TrimRight(r.renderBlocks(doc.FirstChild(), 0), "\n")
+}
+
+// MermaidAttachmentName is the filename used for the i-th successfully
+// attached Mermaid diagram (0-based among attached diagrams only).
+func MermaidAttachmentName(attachedIndex int) string {
+	return fmt.Sprintf("mermaid-%d.jpg", attachedIndex+1)
 }
 
 // DefaultMermaidEndpoint renders a Mermaid diagram to an image from a
@@ -125,7 +144,9 @@ func ExtractImages(md string) []Image {
 }
 
 type renderer struct {
-	source []byte
+	source          []byte
+	mermaidAttached []bool
+	mermaidSeen     *int
 }
 
 func (r renderer) renderBlocks(node ast.Node, depth int) string {
@@ -146,6 +167,11 @@ func (r renderer) renderBlock(node ast.Node, depth int) string {
 		out.WriteString(r.renderInlineChildren(n))
 		out.WriteString("*\n\n")
 	case *ast.Paragraph, *ast.TextBlock:
+		if placeholder, ok := r.mermaidPlaceholderIfAttached(n); ok {
+			out.WriteString(placeholder)
+			out.WriteString("\n\n")
+			break
+		}
 		out.WriteString(r.renderInlineChildren(n))
 		out.WriteString("\n\n")
 	case *ast.Blockquote:
@@ -172,6 +198,11 @@ func (r renderer) renderBlock(node ast.Node, depth int) string {
 			out.WriteByte('\n')
 		}
 	case *ast.FencedCodeBlock:
+		if placeholder, ok := r.mermaidPlaceholderIfAttached(n); ok {
+			out.WriteString(placeholder)
+			out.WriteString("\n\n")
+			break
+		}
 		out.WriteString(r.renderFencedCode(n))
 		out.WriteString("\n\n")
 	case *ast.CodeBlock:
@@ -256,6 +287,42 @@ func (r renderer) renderInlineChildren(parent ast.Node) string {
 		out.WriteString(r.renderInline(child))
 	}
 	return out.String()
+}
+
+// mermaidPlaceholderIfAttached returns a MarkdownV2 placeholder when this node
+// is a Mermaid diagram that was uploaded as an attachment.
+func (r renderer) mermaidPlaceholderIfAttached(n ast.Node) (string, bool) {
+	if r.mermaidSeen == nil || len(r.mermaidAttached) == 0 {
+		return "", false
+	}
+	if !r.isMermaidNode(n) {
+		return "", false
+	}
+	index := *r.mermaidSeen
+	*r.mermaidSeen++
+	if index >= len(r.mermaidAttached) || !r.mermaidAttached[index] {
+		return "", false
+	}
+	attachedIndex := 0
+	for i := 0; i < index; i++ {
+		if r.mermaidAttached[i] {
+			attachedIndex++
+		}
+	}
+	name := MermaidAttachmentName(attachedIndex)
+	return "📎 " + escapeText(name+" (attached image)"), true
+}
+
+func (r renderer) isMermaidNode(n ast.Node) bool {
+	switch n := n.(type) {
+	case *ast.FencedCodeBlock:
+		return strings.EqualFold(strings.TrimSpace(string(n.Language(r.source))), "mermaid")
+	case *ast.Paragraph:
+		diagram := strings.TrimSpace(segmentsText(n.Lines(), r.source))
+		return diagram != "" && mermaidHeaderRe.MatchString(diagram)
+	default:
+		return false
+	}
 }
 
 func (r renderer) renderInline(n ast.Node) string {

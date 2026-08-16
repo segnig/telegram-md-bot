@@ -94,14 +94,14 @@ func handleMessage(ctx context.Context, bot *telegram.Bot, message *telegram.Mes
 		return
 	}
 
-	converted := converter.Convert(message.Text)
-	photos := collectPhotos(ctx, message.Text)
-	if converted == "" && len(photos) == 0 {
+	media := collectPhotos(ctx, message.Text)
+	converted := converter.ConvertMermaid(message.Text, media.MermaidAttached)
+	if converted == "" && len(media.Photos) == 0 {
 		return
 	}
 
-	if len(photos) > 0 {
-		sendAlbumReply(ctx, bot, message.Chat.ID, converted, photos)
+	if len(media.Photos) > 0 {
+		sendAlbumReply(ctx, bot, message.Chat.ID, converted, media.Photos)
 		return
 	}
 	sendTextReply(ctx, bot, message.Chat.ID, converted)
@@ -178,12 +178,22 @@ func captionFallback(converted string) string {
 	return caption
 }
 
+// collectedMedia is the set of uploaded photos for one reply, plus which
+// Mermaid diagrams from ExtractMermaid were successfully attached.
+type collectedMedia struct {
+	Photos          []telegram.InputPhoto
+	MermaidAttached []bool
+}
+
 // collectPhotos downloads markdown images and rendered Mermaid diagrams so
 // they can be uploaded as attachments instead of referenced by URL.
-func collectPhotos(ctx context.Context, markdown string) []telegram.InputPhoto {
+func collectPhotos(ctx context.Context, markdown string) collectedMedia {
 	var photos []telegram.InputPhoto
 
 	for _, image := range converter.ExtractImages(markdown) {
+		if len(photos) >= maxAlbumPhotos {
+			break
+		}
 		photo, err := downloadPhoto(ctx, image.URL)
 		if err != nil {
 			log.Printf("skipping image %q: %v", image.URL, err)
@@ -192,20 +202,26 @@ func collectPhotos(ctx context.Context, markdown string) []telegram.InputPhoto {
 		photos = append(photos, photo)
 	}
 
-	for _, diagram := range converter.ExtractMermaid(markdown) {
+	diagrams := converter.ExtractMermaid(markdown)
+	attached := make([]bool, len(diagrams))
+	mermaidIndex := 0
+	for i, diagram := range diagrams {
+		if len(photos) >= maxAlbumPhotos {
+			break
+		}
 		url := converter.MermaidImageURL(mermaidEndpoint(), diagram)
 		photo, err := downloadPhoto(ctx, url)
 		if err != nil {
 			log.Printf("skipping Mermaid diagram: %v", err)
 			continue
 		}
+		photo.Filename = converter.MermaidAttachmentName(mermaidIndex)
+		mermaidIndex++
 		photos = append(photos, photo)
+		attached[i] = true
 	}
 
-	if len(photos) > maxAlbumPhotos {
-		photos = photos[:maxAlbumPhotos]
-	}
-	return photos
+	return collectedMedia{Photos: photos, MermaidAttached: attached}
 }
 
 func downloadPhoto(ctx context.Context, url string) (telegram.InputPhoto, error) {
