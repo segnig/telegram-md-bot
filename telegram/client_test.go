@@ -33,7 +33,7 @@ func TestTransportErrorsRedactToken(t *testing.T) {
 	token := "123456:SECRET-TOKEN-VALUE"
 	bot := NewWithAPIBase(server.URL, token)
 	bot.client = server.Client()
-	err := bot.SendMessage(context.Background(), 1, "hi", "")
+	err := bot.SendMessage(context.Background(), Target{ChatID: 1}, "hi", "")
 	if err == nil {
 		t.Fatal("expected transport error")
 	}
@@ -79,7 +79,7 @@ func TestSendMessagePayload(t *testing.T) {
 	}))
 	defer server.Close()
 
-	if err := testBot(server).SendMessage(context.Background(), 99, "*hello*", "MarkdownV2"); err != nil {
+	if err := testBot(server).SendMessage(context.Background(), Target{ChatID: 99}, "*hello*", "MarkdownV2"); err != nil {
 		t.Fatalf("SendMessage returned error: %v", err)
 	}
 }
@@ -124,7 +124,7 @@ func TestSendPhotoAttachment(t *testing.T) {
 	defer server.Close()
 
 	photo := InputPhoto{Filename: "logo.png", Data: []byte("PNGDATA")}
-	if err := testBot(server).SendPhoto(context.Background(), 99, photo, "*logo*", "MarkdownV2"); err != nil {
+	if err := testBot(server).SendPhoto(context.Background(), Target{ChatID: 99}, photo, "*logo*", "MarkdownV2"); err != nil {
 		t.Fatalf("SendPhoto returned error: %v", err)
 	}
 }
@@ -163,7 +163,7 @@ func TestSendMediaGroupAttachment(t *testing.T) {
 		{Filename: "a.jpg", Data: []byte("A")},
 		{Filename: "b.jpg", Data: []byte("B")},
 	}
-	if err := testBot(server).SendMediaGroup(context.Background(), 99, photos, "album caption", ""); err != nil {
+	if err := testBot(server).SendMediaGroup(context.Background(), Target{ChatID: 99}, photos, "album caption", ""); err != nil {
 		t.Fatalf("SendMediaGroup returned error: %v", err)
 	}
 }
@@ -175,7 +175,7 @@ func TestRateLimitErrorExposesRetryDelay(t *testing.T) {
 	}))
 	defer server.Close()
 
-	err := testBot(server).SendMessage(context.Background(), 99, "hello", "")
+	err := testBot(server).SendMessage(context.Background(), Target{ChatID: 99}, "hello", "")
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) || apiErr.Code != 429 {
 		t.Fatalf("expected APIError 429, got %v", err)
@@ -194,7 +194,7 @@ func TestRequestCancellation(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err := testBot(server).SendMessage(ctx, 99, "hello", "")
+	err := testBot(server).SendMessage(ctx, Target{ChatID: 99}, "hello", "")
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context cancellation, got %v", err)
 	}
@@ -238,5 +238,32 @@ func TestChatIsGroupOrChannel(t *testing.T) {
 		if got := (Chat{Type: test.kind}).IsGroupOrChannel(); got != test.want {
 			t.Errorf("type %q: got %v, want %v", test.kind, got, test.want)
 		}
+	}
+	if !(Chat{Type: "group"}).IsGroup() || !(Chat{Type: "supergroup"}).IsGroup() {
+		t.Error("group and supergroup should report IsGroup")
+	}
+	if (Chat{Type: "channel"}).IsGroup() || (Chat{Type: "private"}).IsGroup() {
+		t.Error("channel and private should not report IsGroup")
+	}
+}
+
+func TestDeleteMessage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/deleteMessage") {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if payload["chat_id"] != float64(99) || payload["message_id"] != float64(7) {
+			t.Errorf("unexpected payload: %#v", payload)
+		}
+		_, _ = w.Write([]byte(`{"ok":true,"result":true}`))
+	}))
+	defer server.Close()
+
+	if err := testBot(server).DeleteMessage(context.Background(), 99, 7); err != nil {
+		t.Fatalf("DeleteMessage returned error: %v", err)
 	}
 }

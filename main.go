@@ -41,8 +41,10 @@ const welcomeText = "Send me CommonMark or GitHub-Flavored Markdown and I'll con
 	"In a private chat, just paste markdown.\n\n" +
 	"In a group or channel, start the message with /md@the_bot followed by your markdown:\n\n" +
 	"/md@the_bot **bold** and `code`\n\n" +
-	"Mentioning me or replying to one of my messages also works, but only if privacy mode " +
-	"is disabled for me in @BotFather (/setprivacy, then re-add me to the group).\n\n" +
+	"In a group the conversion is sent as a reply to the original message. " +
+	"In a channel the post is edited in place " +
+	"(needs \"edit messages\"). Mentions and replies also work if privacy mode is disabled for me " +
+	"in @BotFather (/setprivacy, then re-add me to the group).\n\n" +
 	"Supported features include nested emphasis, links, images, task lists, blockquotes, fenced code, and tables. " +
 	"Markdown images and Mermaid diagrams are uploaded as attachments in the same reply."
 
@@ -132,7 +134,7 @@ func handleMessage(ctx context.Context, bot *telegram.Bot, identity botIdentity,
 	if argument, ok := commandArgument(content, convertCommands...); ok {
 		if strings.TrimSpace(argument) == "" {
 			usage := strings.ReplaceAll(commandUsageText, "@the_bot", "@"+identity.Username)
-			if err := sendWithRetry(ctx, bot, message.Chat.ID, usage, ""); err != nil {
+			if err := sendWithRetry(ctx, bot, replyTarget(message), usage, ""); err != nil {
 				log.Printf("send usage failed (chat %d): %v", message.Chat.ID, err)
 			}
 			return
@@ -154,7 +156,7 @@ func handleMessage(ctx context.Context, bot *telegram.Bot, identity botIdentity,
 
 	if isCommand(content, "start") || isCommand(content, "help") {
 		welcome := strings.ReplaceAll(welcomeText, "@the_bot", "@"+identity.Username)
-		if err := sendWithRetry(ctx, bot, message.Chat.ID, welcome, ""); err != nil {
+		if err := sendWithRetry(ctx, bot, replyTarget(message), welcome, ""); err != nil {
 			log.Printf("send welcome failed (chat %d): %v", message.Chat.ID, err)
 		}
 		return
@@ -166,11 +168,50 @@ func handleMessage(ctx context.Context, bot *telegram.Bot, identity botIdentity,
 		return
 	}
 
-	if len(media.Photos) > 0 {
-		sendAlbumReply(ctx, bot, message.Chat.ID, converted, media.Photos)
+	// In a channel the bot can replace the post it was given, which reads as
+	// the markdown simply rendering itself. Attachments rule that out, because
+	// Telegram cannot turn a text message into an album.
+	if message.Chat.IsChannel() && len(media.Photos) == 0 &&
+		editOriginalPost(ctx, bot, message, converted) {
 		return
 	}
-	sendTextReply(ctx, bot, message.Chat.ID, converted)
+
+	target := replyTarget(message)
+	if len(media.Photos) > 0 {
+		sendAlbumReply(ctx, bot, target, converted, media.Photos)
+	} else {
+		sendTextReply(ctx, bot, target, converted)
+	}
+}
+
+// replyTarget attaches the answer to the message that asked for it, so it stays
+// next to its source. A private chat needs no such anchor.
+func replyTarget(message *telegram.Message) telegram.Target {
+	target := telegram.Target{ChatID: message.Chat.ID}
+	if message.Chat.IsGroupOrChannel() {
+		target.ReplyTo = message.MessageID
+	}
+	return target
+}
+
+// editOriginalPost rewrites a channel post as its converted form and reports
+// whether that worked. It fails when the bot is not an administrator with the
+// "edit messages" right, or when the result is too long for one message, and
+// the caller then falls back to an ordinary reply.
+func editOriginalPost(ctx context.Context, bot *telegram.Bot, message *telegram.Message, converted string) bool {
+	chunks := converter.Split(converted, maxTelegramText)
+	if len(chunks) != 1 {
+		return false
+	}
+	err := retry(ctx, func() error {
+		return bot.EditMessageText(ctx, message.Chat.ID, message.MessageID, chunks[0], "MarkdownV2")
+	})
+	if err != nil {
+		log.Printf("editing post %d in chat %d failed, replying instead: %v",
+			message.MessageID, message.Chat.ID, err)
+		return false
+	}
+	return true
 }
 
 // logUpdate records every inbound chat so group/channel delivery problems are
@@ -365,54 +406,56 @@ func utf16Slice(s string, offset, length int) string {
 
 // sendAlbumReply delivers the response as the attachments plus their caption.
 // Telegram caps a caption far below a message, so text that does not fit
-// continues in follow-up messages rather than being dropped.
-func sendAlbumReply(ctx context.Context, bot *telegram.Bot, chatID int64, converted string, photos []telegram.InputPhoto) {
+// continues in follow-up messages rather than being dropped. It reports whether
+// the whole response reached the chat.
+func sendAlbumReply(ctx context.Context, bot *telegram.Bot, target telegram.Target, converted string, photos []telegram.InputPhoto) bool {
 	caption, rest := "", ""
 	if chunks := converter.Split(converted, maxTelegramCaption); len(chunks) > 0 {
 		caption = chunks[0]
 		rest = strings.Join(chunks[1:], "\n\n")
 	}
 
-	err := sendPhotos(ctx, bot, chatID, photos, caption, "MarkdownV2")
+	err := sendPhotos(ctx, bot, target, photos, caption, "MarkdownV2")
 	if err != nil && caption != "" {
 		log.Printf("album with MarkdownV2 caption failed: %v", err)
-		err = sendPhotos(ctx, bot, chatID, photos, captionFallback(caption), "")
+		err = sendPhotos(ctx, bot, target, photos, captionFallback(caption), "")
 	}
 	if err != nil {
 		log.Printf("sending attachments failed: %v", err)
-		sendTextReply(ctx, bot, chatID, converted)
-		return
+		return sendTextReply(ctx, bot, target, converted)
 	}
-	sendTextReply(ctx, bot, chatID, rest)
+	return sendTextReply(ctx, bot, target, rest)
 }
 
-func sendPhotos(ctx context.Context, bot *telegram.Bot, chatID int64, photos []telegram.InputPhoto, caption, parseMode string) error {
+func sendPhotos(ctx context.Context, bot *telegram.Bot, target telegram.Target, photos []telegram.InputPhoto, caption, parseMode string) error {
 	if len(photos) == 1 {
 		return retry(ctx, func() error {
-			return bot.SendPhoto(ctx, chatID, photos[0], caption, parseMode)
+			return bot.SendPhoto(ctx, target, photos[0], caption, parseMode)
 		})
 	}
 	return retry(ctx, func() error {
-		return bot.SendMediaGroup(ctx, chatID, photos, caption, parseMode)
+		return bot.SendMediaGroup(ctx, target, photos, caption, parseMode)
 	})
 }
 
 // sendTextReply sends the rendered MarkdownV2 preview, splitting at block
-// boundaries so each part is still valid MarkdownV2 on its own.
-func sendTextReply(ctx context.Context, bot *telegram.Bot, chatID int64, converted string) {
+// boundaries so each part is still valid MarkdownV2 on its own. It reports
+// whether every part reached the chat.
+func sendTextReply(ctx context.Context, bot *telegram.Bot, target telegram.Target, converted string) bool {
 	for _, chunk := range converter.Split(converted, maxTelegramText) {
-		err := sendWithRetry(ctx, bot, chatID, chunk, "MarkdownV2")
+		err := sendWithRetry(ctx, bot, target, chunk, "MarkdownV2")
 		if err == nil {
 			continue
 		}
 		// Rather than losing the part Telegram refused to parse, resend it
 		// unformatted with the escapes stripped.
 		log.Printf("preview reply failed: %v%s", err, offsetContext(chunk, err))
-		if err := sendWithRetry(ctx, bot, chatID, unescape(chunk), ""); err != nil {
+		if err := sendWithRetry(ctx, bot, target, unescape(chunk), ""); err != nil {
 			log.Printf("send fallback failed: %v", err)
-			return
+			return false
 		}
 	}
+	return true
 }
 
 func captionFallback(converted string) string {
@@ -620,9 +663,9 @@ func previewFallbackText(err error) string {
 	return "Preview could not be rendered."
 }
 
-func sendWithRetry(ctx context.Context, bot *telegram.Bot, chatID int64, text, parseMode string) error {
+func sendWithRetry(ctx context.Context, bot *telegram.Bot, target telegram.Target, text, parseMode string) error {
 	return retry(ctx, func() error {
-		return bot.SendMessage(ctx, chatID, text, parseMode)
+		return bot.SendMessage(ctx, target, text, parseMode)
 	})
 }
 

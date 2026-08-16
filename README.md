@@ -180,6 +180,17 @@ limit, since it has no legal cut point.
 - Only the addressing prefix is removed from a group message; the document that
   follows reaches the converter unchanged, so a group and a private chat render
   the same input identically.
+- In a group the converted message replaces the original: the bot posts the
+  rendered version and then deletes the source message, which needs the "delete
+  messages" administrator right. The send always precedes the delete, and a
+  failed send cancels it, so the markdown is never lost.
+- In a channel the original post is edited in place, when the bot is an
+  administrator with the "edit messages" right and the result is text that fits
+  one message. Telegram cannot turn a text message into an album, so a post with
+  images or Mermaid diagrams is answered as a reply instead, and a rejected edit
+  also falls back to a reply.
+- Private chats get a plain message, and command replies such as /help stay
+  ordinary replies everywhere.
 - Every inbound update is logged with its chat type, entities, and text, and
   ignored group messages say why, so delivery problems are visible in the log.
 - Nested blockquotes are flattened to one level, since Telegram cannot nest them.
@@ -232,7 +243,12 @@ Then message your bot on Telegram — try `/start`, or paste some markdown.
 
 1. Add the bot to the group or channel (for channels it must be an
    administrator with permission to post messages).
-2. Send the markdown after a `/md` command, on the same message:
+2. In a **group**, promote the bot to administrator and enable **Delete
+   messages**. Without that right the conversion is still posted, but the
+   original markdown stays in the chat.
+3. In a **channel**, promote the bot and enable **Edit messages** so the post
+   can be rewritten in place.
+4. Send the markdown after a `/md` command, on the same message:
 
    ```
    /md@YourBot # Title
@@ -269,6 +285,25 @@ To make plain mentions and ordinary messages work:
    applied when the bot joins, so existing memberships keep the old behavior.
 
 Replying to one of the bot's own messages works either way.
+
+### Where the answer goes
+
+In a group the bot posts the rendered version and deletes the original message,
+so the markdown appears to turn into its preview. This needs the bot to be an
+administrator with **Delete messages**; without that right the delete is
+refused, the original stays above the answer, and the reason is logged.
+
+The bot cannot simply edit the original: the Bot API only lets a bot edit its
+own messages, and the `can_edit_messages` administrator right is channels-only.
+Deleting and reposting is the closest equivalent. The conversion is always sent
+before the delete, so a failure never destroys the only copy of the markdown.
+
+In a **channel** the bot does edit the original post in place, replacing the
+markdown with its rendered form. That needs the bot to be an administrator with
+**Edit messages**, and it only applies to text — a post whose markdown contains
+images or Mermaid diagrams is answered with an attachment reply, because a text
+message cannot be converted into an album. If the edit is refused, the bot
+replies instead rather than dropping the answer.
 
 If a group message is ignored, the log line says so explicitly, including the
 chat type and the text that arrived. If nothing is logged at all, Telegram never

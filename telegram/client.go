@@ -129,6 +129,12 @@ func (m *Message) ContentEntities() []MessageEntity {
 	return m.CaptionEntities
 }
 
+// IsChannel reports whether the chat is a channel, where posts belong to the
+// channel itself and an administrator bot may edit them.
+func (c Chat) IsChannel() bool {
+	return c.Type == "channel"
+}
+
 // IsGroupOrChannel reports whether the chat is a group, supergroup, or channel.
 func (c Chat) IsGroupOrChannel() bool {
 	switch c.Type {
@@ -196,15 +202,38 @@ func (b *Bot) GetMe(ctx context.Context) (User, error) {
 	return me, nil
 }
 
+// Target is where a reply goes: the chat, and optionally the message it should
+// hang off as a reply.
+type Target struct {
+	ChatID  int64
+	ReplyTo int
+}
+
+// replyParameters describes the message being replied to, or nil when the reply
+// should stand on its own. Sending is allowed to proceed if the original message
+// is gone, so a deleted message never costs us the answer.
+func (t Target) replyParameters() map[string]any {
+	if t.ReplyTo <= 0 {
+		return nil
+	}
+	return map[string]any{
+		"message_id":                  t.ReplyTo,
+		"allow_sending_without_reply": true,
+	}
+}
+
 // SendMessage sends text to a chat. parseMode may be "MarkdownV2", "HTML", or
 // empty for plain text.
-func (b *Bot) SendMessage(ctx context.Context, chatID int64, text, parseMode string) error {
+func (b *Bot) SendMessage(ctx context.Context, target Target, text, parseMode string) error {
 	payload := map[string]any{
-		"chat_id": chatID,
+		"chat_id": target.ChatID,
 		"text":    text,
 	}
 	if parseMode != "" {
 		payload["parse_mode"] = parseMode
+	}
+	if reply := target.replyParameters(); reply != nil {
+		payload["reply_parameters"] = reply
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -213,6 +242,27 @@ func (b *Bot) SendMessage(ctx context.Context, chatID int64, text, parseMode str
 
 	var sent Message
 	return b.call(ctx, http.MethodPost, "/sendMessage", body, &sent)
+}
+
+// EditMessageText replaces the text of an existing message. Telegram only lets
+// a bot edit its own messages, except in channels, where an administrator bot
+// with the "edit messages" right may edit any post.
+func (b *Bot) EditMessageText(ctx context.Context, chatID int64, messageID int, text, parseMode string) error {
+	payload := map[string]any{
+		"chat_id":    chatID,
+		"message_id": messageID,
+		"text":       text,
+	}
+	if parseMode != "" {
+		payload["parse_mode"] = parseMode
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("encode editMessageText request: %w", err)
+	}
+
+	var edited Message
+	return b.call(ctx, http.MethodPost, "/editMessageText", body, &edited)
 }
 
 // InputPhoto is image data uploaded to Telegram as a real attachment rather
@@ -224,16 +274,23 @@ type InputPhoto struct {
 
 // SendPhoto uploads a single photo with an optional caption, producing one
 // message.
-func (b *Bot) SendPhoto(ctx context.Context, chatID int64, photo InputPhoto, caption, parseMode string) error {
+func (b *Bot) SendPhoto(ctx context.Context, target Target, photo InputPhoto, caption, parseMode string) error {
 	var body bytes.Buffer
 	form := multipart.NewWriter(&body)
 
-	fields := map[string]string{"chat_id": strconv.FormatInt(chatID, 10)}
+	fields := map[string]string{"chat_id": strconv.FormatInt(target.ChatID, 10)}
 	if caption != "" {
 		fields["caption"] = caption
 	}
 	if parseMode != "" {
 		fields["parse_mode"] = parseMode
+	}
+	if reply := target.replyParameters(); reply != nil {
+		encoded, err := json.Marshal(reply)
+		if err != nil {
+			return fmt.Errorf("encode sendPhoto reply_parameters: %w", err)
+		}
+		fields["reply_parameters"] = string(encoded)
 	}
 	for name, value := range fields {
 		if err := form.WriteField(name, value); err != nil {
@@ -253,7 +310,7 @@ func (b *Bot) SendPhoto(ctx context.Context, chatID int64, photo InputPhoto, cap
 
 // SendMediaGroup uploads several photos as one album. Telegram attaches the
 // caption to the album by placing it on the first item.
-func (b *Bot) SendMediaGroup(ctx context.Context, chatID int64, photos []InputPhoto, caption, parseMode string) error {
+func (b *Bot) SendMediaGroup(ctx context.Context, target Target, photos []InputPhoto, caption, parseMode string) error {
 	if len(photos) == 0 {
 		return errors.New("sendMediaGroup requires at least one photo")
 	}
@@ -281,11 +338,20 @@ func (b *Bot) SendMediaGroup(ctx context.Context, chatID int64, photos []InputPh
 	if err != nil {
 		return fmt.Errorf("encode sendMediaGroup media: %w", err)
 	}
-	if err := form.WriteField("chat_id", strconv.FormatInt(chatID, 10)); err != nil {
+	if err := form.WriteField("chat_id", strconv.FormatInt(target.ChatID, 10)); err != nil {
 		return fmt.Errorf("write sendMediaGroup chat_id: %w", err)
 	}
 	if err := form.WriteField("media", string(encodedMedia)); err != nil {
 		return fmt.Errorf("write sendMediaGroup media: %w", err)
+	}
+	if reply := target.replyParameters(); reply != nil {
+		encodedReply, err := json.Marshal(reply)
+		if err != nil {
+			return fmt.Errorf("encode sendMediaGroup reply_parameters: %w", err)
+		}
+		if err := form.WriteField("reply_parameters", string(encodedReply)); err != nil {
+			return fmt.Errorf("write sendMediaGroup reply_parameters: %w", err)
+		}
 	}
 	if err := form.Close(); err != nil {
 		return fmt.Errorf("finalize sendMediaGroup form: %w", err)

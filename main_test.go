@@ -50,11 +50,48 @@ func imageServer(t *testing.T) *httptest.Server {
 }
 
 type recordedCall struct {
-	path    string
-	text    string
-	caption string
-	mode    string
-	files   int
+	path      string
+	text      string
+	caption   string
+	mode      string
+	files     int
+	replyTo   int
+	editingID int
+}
+
+// sentCalls drops the housekeeping calls, leaving the ones that actually
+// delivered the conversion.
+func sentCalls(calls []recordedCall) []recordedCall {
+	sent := make([]recordedCall, 0, len(calls))
+	for _, call := range calls {
+		if call.path != "/deleteMessage" {
+			sent = append(sent, call)
+		}
+	}
+	return sent
+}
+
+// deletedMessage returns the message a deleteMessage call removed, or 0 when
+// nothing was deleted.
+func deletedMessage(calls []recordedCall) int {
+	for _, call := range calls {
+		if call.path == "/deleteMessage" {
+			return call.editingID
+		}
+	}
+	return 0
+}
+
+// replyTarget extracts the message a call was attached to, from the
+// reply_parameters object Telegram expects.
+func replyTargetOf(encoded string) int {
+	var parameters struct {
+		MessageID int `json:"message_id"`
+	}
+	if json.Unmarshal([]byte(encoded), &parameters) != nil {
+		return 0
+	}
+	return parameters.MessageID
 }
 
 func telegramServer(t *testing.T, calls *[]recordedCall) *httptest.Server {
@@ -74,7 +111,19 @@ func telegramServer(t *testing.T, calls *[]recordedCall) *httptest.Server {
 			call.text, _ = payload["text"].(string)
 			call.caption, _ = payload["caption"].(string)
 			call.mode, _ = payload["parse_mode"].(string)
+			if id, ok := payload["message_id"].(float64); ok {
+				call.editingID = int(id)
+			}
+			if reply, ok := payload["reply_parameters"].(map[string]any); ok {
+				if id, ok := reply["message_id"].(float64); ok {
+					call.replyTo = int(id)
+				}
+			}
 			*calls = append(*calls, call)
+			if method == "/deleteMessage" {
+				_, _ = w.Write([]byte(`{"ok":true,"result":true}`))
+				return
+			}
 			_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":1,"chat":{"id":1}}}`))
 			return
 		}
@@ -84,6 +133,7 @@ func telegramServer(t *testing.T, calls *[]recordedCall) *httptest.Server {
 		call.text = r.FormValue("text")
 		call.caption = r.FormValue("caption")
 		call.mode = r.FormValue("parse_mode")
+		call.replyTo = replyTargetOf(r.FormValue("reply_parameters"))
 		if r.MultipartForm != nil {
 			for _, files := range r.MultipartForm.File {
 				call.files += len(files)
@@ -433,6 +483,7 @@ func TestGroupRespondsToMention(t *testing.T) {
 			Length: len("@testbot"),
 		}},
 	})
+	calls = sentCalls(calls)
 	if len(calls) != 1 {
 		t.Fatalf("got %d calls, want 1: %#v", len(calls), calls)
 	}
@@ -480,7 +531,7 @@ func TestGroupRespondsToReply(t *testing.T) {
 			From: &telegram.User{Username: "testbot", IsBot: true},
 		},
 	})
-	if len(calls) != 1 {
+	if len(sentCalls(calls)) != 1 {
 		t.Fatalf("reply to bot was ignored: %#v", calls)
 	}
 }
@@ -516,6 +567,7 @@ func TestGroupConvertCommandWorksWithoutMention(t *testing.T) {
 			Length: len("/md@testbot"),
 		}},
 	})
+	calls = sentCalls(calls)
 	if len(calls) != 1 {
 		t.Fatalf("got %d calls, want 1: %#v", len(calls), calls)
 	}
@@ -545,6 +597,201 @@ func TestBareConvertCommandExplainsUsage(t *testing.T) {
 	}
 }
 
+// A bot cannot edit a group member's message, so the rendered version is posted
+// and the original deleted, which leaves the same end state.
+func TestGroupOriginalIsReplacedByTheConversion(t *testing.T) {
+	var calls []recordedCall
+	api := telegramServer(t, &calls)
+	defer api.Close()
+
+	bot := telegram.NewWithAPIBase(api.URL, "token")
+	handleMessage(context.Background(), bot, testIdentity, &telegram.Message{
+		MessageID: 555,
+		Text:      "/md@testbot **bold**",
+		Chat:      telegram.Chat{ID: -100, Type: "supergroup"},
+	})
+	if len(calls) != 2 {
+		t.Fatalf("got %d calls, want a send then a delete: %#v", len(calls), calls)
+	}
+	if calls[0].path != "/sendMessage" || !strings.Contains(calls[0].text, "*bold*") {
+		t.Errorf("first call = %q %q, want the conversion", calls[0].path, calls[0].text)
+	}
+	// The send must come first: a failed delete then costs nothing.
+	if calls[1].path != "/deleteMessage" {
+		t.Fatalf("second call = %q, want /deleteMessage", calls[1].path)
+	}
+	if calls[1].editingID != 555 {
+		t.Errorf("deleted message = %d, want 555", calls[1].editingID)
+	}
+	if calls[0].replyTo != 0 {
+		t.Errorf("the replacement should stand alone, got reply target %d", calls[0].replyTo)
+	}
+}
+
+// If the conversion never reached the chat, deleting the original would destroy
+// the only copy of it.
+func TestOriginalSurvivesAFailedSend(t *testing.T) {
+	var paths []string
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method := r.URL.Path
+		if index := strings.LastIndex(method, "/"); index >= 0 {
+			method = method[index:]
+		}
+		paths = append(paths, method)
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"ok":false,"error_code":400,"description":"Bad Request: chat not found"}`))
+	}))
+	defer api.Close()
+
+	bot := telegram.NewWithAPIBase(api.URL, "token")
+	handleMessage(context.Background(), bot, testIdentity, &telegram.Message{
+		MessageID: 555,
+		Text:      "/md@testbot **bold**",
+		Chat:      telegram.Chat{ID: -100, Type: "supergroup"},
+	})
+	for _, path := range paths {
+		if path == "/deleteMessage" {
+			t.Fatalf("original was deleted after a failed send: %v", paths)
+		}
+	}
+}
+
+func TestGroupWithImagesAlsoReplacesTheOriginal(t *testing.T) {
+	images := imageServer(t)
+	defer images.Close()
+	var calls []recordedCall
+	api := telegramServer(t, &calls)
+	defer api.Close()
+
+	bot := telegram.NewWithAPIBase(api.URL, "token")
+	handleMessage(context.Background(), bot, testIdentity, &telegram.Message{
+		MessageID: 77,
+		Text:      "/md@testbot ![logo](" + images.URL + "/img.png)",
+		Chat:      telegram.Chat{ID: -100, Type: "supergroup"},
+	})
+	if got := sentCalls(calls); len(got) == 0 || got[0].path != "/sendPhoto" {
+		t.Fatalf("expected a photo to be sent, got %#v", calls)
+	}
+	if deletedMessage(calls) != 77 {
+		t.Errorf("deleted message = %d, want 77", deletedMessage(calls))
+	}
+}
+
+func TestPrivateReplyIsNotAThreadedReply(t *testing.T) {
+	var calls []recordedCall
+	api := telegramServer(t, &calls)
+	defer api.Close()
+
+	bot := telegram.NewWithAPIBase(api.URL, "token")
+	handleMessage(context.Background(), bot, testIdentity, &telegram.Message{
+		MessageID: 7,
+		Text:      "**bold**",
+		Chat:      telegram.Chat{ID: 1, Type: "private"},
+	})
+	if len(calls) != 1 {
+		t.Fatalf("got %d calls, want 1", len(calls))
+	}
+	if calls[0].replyTo != 0 {
+		t.Errorf("private chat should not reply to a message, got target %d", calls[0].replyTo)
+	}
+}
+
+func TestChannelPostIsEditedInPlace(t *testing.T) {
+	var calls []recordedCall
+	api := telegramServer(t, &calls)
+	defer api.Close()
+
+	bot := telegram.NewWithAPIBase(api.URL, "token")
+	handleMessage(context.Background(), bot, testIdentity, &telegram.Message{
+		MessageID: 42,
+		Text:      "/md@testbot # Title",
+		Chat:      telegram.Chat{ID: -200, Type: "channel"},
+	})
+	if len(calls) != 1 {
+		t.Fatalf("got %d calls, want 1: %#v", len(calls), calls)
+	}
+	if calls[0].path != "/editMessageText" {
+		t.Fatalf("path = %q, want /editMessageText", calls[0].path)
+	}
+	if calls[0].editingID != 42 {
+		t.Errorf("edited message = %d, want 42", calls[0].editingID)
+	}
+	if calls[0].mode != "MarkdownV2" || !strings.Contains(calls[0].text, "*Title*") {
+		t.Errorf("edit payload = %q (mode %q)", calls[0].text, calls[0].mode)
+	}
+}
+
+// Without the "edit messages" right Telegram refuses the edit, and the answer
+// must still reach the channel.
+func TestChannelFallsBackToReplyWhenEditIsRejected(t *testing.T) {
+	var calls []recordedCall
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/editMessageText") {
+			calls = append(calls, recordedCall{path: "/editMessageText"})
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"ok":false,"error_code":400,"description":"Bad Request: message can't be edited"}`))
+			return
+		}
+		var payload map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		call := recordedCall{path: "/sendMessage"}
+		call.text, _ = payload["text"].(string)
+		if reply, ok := payload["reply_parameters"].(map[string]any); ok {
+			if id, ok := reply["message_id"].(float64); ok {
+				call.replyTo = int(id)
+			}
+		}
+		calls = append(calls, call)
+		_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":1,"chat":{"id":1}}}`))
+	}))
+	defer api.Close()
+
+	bot := telegram.NewWithAPIBase(api.URL, "token")
+	handleMessage(context.Background(), bot, testIdentity, &telegram.Message{
+		MessageID: 42,
+		Text:      "/md@testbot # Title",
+		Chat:      telegram.Chat{ID: -200, Type: "channel"},
+	})
+	if len(calls) != 2 {
+		t.Fatalf("got %d calls, want an edit then a reply: %#v", len(calls), calls)
+	}
+	if calls[1].path != "/sendMessage" {
+		t.Fatalf("fallback path = %q, want /sendMessage", calls[1].path)
+	}
+	if calls[1].replyTo != 42 {
+		t.Errorf("fallback reply target = %d, want 42", calls[1].replyTo)
+	}
+	if !strings.Contains(calls[1].text, "*Title*") {
+		t.Errorf("fallback text = %q", calls[1].text)
+	}
+}
+
+// A text message cannot become an album, so a post with attachments is answered
+// rather than edited.
+func TestChannelPostWithImageIsAnsweredNotEdited(t *testing.T) {
+	images := imageServer(t)
+	defer images.Close()
+	var calls []recordedCall
+	api := telegramServer(t, &calls)
+	defer api.Close()
+
+	bot := telegram.NewWithAPIBase(api.URL, "token")
+	handleMessage(context.Background(), bot, testIdentity, &telegram.Message{
+		MessageID: 42,
+		Text:      "/md@testbot ![logo](" + images.URL + "/img.png)",
+		Chat:      telegram.Chat{ID: -200, Type: "channel"},
+	})
+	if len(calls) == 0 {
+		t.Fatal("no API calls were made")
+	}
+	if calls[0].path != "/sendPhoto" {
+		t.Fatalf("path = %q, want /sendPhoto", calls[0].path)
+	}
+	if calls[0].replyTo != 42 {
+		t.Errorf("reply target = %d, want 42", calls[0].replyTo)
+	}
+}
+
 // A group message must reach the converter as the same document a private chat
 // would deliver: only the addressing prefix may differ.
 func TestGroupParsesExactlyLikePrivateChat(t *testing.T) {
@@ -566,7 +813,7 @@ func TestGroupParsesExactlyLikePrivateChat(t *testing.T) {
 		bot := telegram.NewWithAPIBase(api.URL, "token")
 		handleMessage(context.Background(), bot, testIdentity, message)
 		sent := make([]string, 0, len(calls))
-		for _, call := range calls {
+		for _, call := range sentCalls(calls) {
 			sent = append(sent, call.caption+call.text)
 		}
 		return sent
