@@ -225,6 +225,20 @@ func TestIncomingMessagePrefersEditedChannelPost(t *testing.T) {
 	}
 }
 
+func TestDeleteWebhook(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/deleteWebhook") {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"ok":true,"result":true}`))
+	}))
+	defer server.Close()
+
+	if err := testBot(server).DeleteWebhook(context.Background()); err != nil {
+		t.Fatalf("DeleteWebhook returned error: %v", err)
+	}
+}
+
 func TestChatIsGroupOrChannel(t *testing.T) {
 	for _, test := range []struct {
 		kind string

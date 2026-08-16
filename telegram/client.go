@@ -202,6 +202,13 @@ func (b *Bot) GetMe(ctx context.Context) (User, error) {
 	return me, nil
 }
 
+// DeleteWebhook clears any webhook so long-polling getUpdates can receive
+// messages. Telegram refuses getUpdates while a webhook is active.
+func (b *Bot) DeleteWebhook(ctx context.Context) error {
+	var ok bool
+	return b.call(ctx, http.MethodGet, "/deleteWebhook", nil, &ok)
+}
+
 // Target is where a reply goes: the chat, and optionally the message it should
 // hang off as a reply.
 type Target struct {
