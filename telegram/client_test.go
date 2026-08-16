@@ -239,31 +239,7 @@ func TestChatIsGroupOrChannel(t *testing.T) {
 			t.Errorf("type %q: got %v, want %v", test.kind, got, test.want)
 		}
 	}
-	if !(Chat{Type: "group"}).IsGroup() || !(Chat{Type: "supergroup"}).IsGroup() {
-		t.Error("group and supergroup should report IsGroup")
-	}
-	if (Chat{Type: "channel"}).IsGroup() || (Chat{Type: "private"}).IsGroup() {
-		t.Error("channel and private should not report IsGroup")
-	}
-}
-
-func TestDeleteMessage(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasSuffix(r.URL.Path, "/deleteMessage") {
-			t.Errorf("path = %q", r.URL.Path)
-		}
-		var payload map[string]any
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-			t.Fatalf("decode request: %v", err)
-		}
-		if payload["chat_id"] != float64(99) || payload["message_id"] != float64(7) {
-			t.Errorf("unexpected payload: %#v", payload)
-		}
-		_, _ = w.Write([]byte(`{"ok":true,"result":true}`))
-	}))
-	defer server.Close()
-
-	if err := testBot(server).DeleteMessage(context.Background(), 99, 7); err != nil {
-		t.Fatalf("DeleteMessage returned error: %v", err)
+	if !(Chat{Type: "channel"}).IsChannel() || (Chat{Type: "group"}).IsChannel() {
+		t.Error("only channel should report IsChannel")
 	}
 }

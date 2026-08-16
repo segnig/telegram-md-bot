@@ -61,10 +61,51 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Render Free Web Services require a process that listens on $PORT.
+	// The health server is optional locally (no PORT) and mandatory on Render.
+	startHealthServer(ctx)
+
 	bot := telegram.NewWithAPIBase(os.Getenv("TELEGRAM_API_BASE"), token)
 	if err := run(ctx, bot); err != nil {
 		log.Printf("bot stopped: %v", err)
 	}
+}
+
+// startHealthServer binds the HTTP health endpoints Render probes. Without
+// this, a Free Web Service is marked unhealthy and restarted in a loop.
+func startHealthServer(ctx context.Context) {
+	port := strings.TrimSpace(os.Getenv("PORT"))
+	if port == "" {
+		return
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = io.WriteString(w, "telegram-md-bot is running\n")
+	})
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "ok")
+	})
+
+	server := &http.Server{
+		Addr:              ":" + port,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	go func() {
+		log.Printf("health server listening on :%s (Render Free Web Service)", port)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("health server stopped: %v", err)
+		}
+	}()
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutdownCtx)
+	}()
 }
 
 func run(ctx context.Context, bot *telegram.Bot) error {

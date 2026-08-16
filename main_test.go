@@ -4,12 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"telegram-md-bot/telegram"
@@ -71,18 +75,7 @@ func sentCalls(calls []recordedCall) []recordedCall {
 	return sent
 }
 
-// deletedMessage returns the message a deleteMessage call removed, or 0 when
-// nothing was deleted.
-func deletedMessage(calls []recordedCall) int {
-	for _, call := range calls {
-		if call.path == "/deleteMessage" {
-			return call.editingID
-		}
-	}
-	return 0
-}
-
-// replyTarget extracts the message a call was attached to, from the
+// replyTargetOf extracts the message a call was attached to, from the
 // reply_parameters object Telegram expects.
 func replyTargetOf(encoded string) int {
 	var parameters struct {
@@ -597,9 +590,9 @@ func TestBareConvertCommandExplainsUsage(t *testing.T) {
 	}
 }
 
-// A bot cannot edit a group member's message, so the rendered version is posted
-// and the original deleted, which leaves the same end state.
-func TestGroupOriginalIsReplacedByTheConversion(t *testing.T) {
+// A bot cannot edit a group member's message, so the answer is attached as a
+// reply to the message that asked for it.
+func TestGroupReplyIsAttachedToTheOriginalMessage(t *testing.T) {
 	var calls []recordedCall
 	api := telegramServer(t, &calls)
 	defer api.Close()
@@ -610,53 +603,18 @@ func TestGroupOriginalIsReplacedByTheConversion(t *testing.T) {
 		Text:      "/md@testbot **bold**",
 		Chat:      telegram.Chat{ID: -100, Type: "supergroup"},
 	})
-	if len(calls) != 2 {
-		t.Fatalf("got %d calls, want a send then a delete: %#v", len(calls), calls)
+	if len(calls) != 1 {
+		t.Fatalf("got %d calls, want 1: %#v", len(calls), calls)
 	}
 	if calls[0].path != "/sendMessage" || !strings.Contains(calls[0].text, "*bold*") {
-		t.Errorf("first call = %q %q, want the conversion", calls[0].path, calls[0].text)
+		t.Errorf("call = %q %q, want the conversion", calls[0].path, calls[0].text)
 	}
-	// The send must come first: a failed delete then costs nothing.
-	if calls[1].path != "/deleteMessage" {
-		t.Fatalf("second call = %q, want /deleteMessage", calls[1].path)
-	}
-	if calls[1].editingID != 555 {
-		t.Errorf("deleted message = %d, want 555", calls[1].editingID)
-	}
-	if calls[0].replyTo != 0 {
-		t.Errorf("the replacement should stand alone, got reply target %d", calls[0].replyTo)
+	if calls[0].replyTo != 555 {
+		t.Errorf("reply target = %d, want 555", calls[0].replyTo)
 	}
 }
 
-// If the conversion never reached the chat, deleting the original would destroy
-// the only copy of it.
-func TestOriginalSurvivesAFailedSend(t *testing.T) {
-	var paths []string
-	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		method := r.URL.Path
-		if index := strings.LastIndex(method, "/"); index >= 0 {
-			method = method[index:]
-		}
-		paths = append(paths, method)
-		w.WriteHeader(http.StatusBadRequest)
-		_, _ = w.Write([]byte(`{"ok":false,"error_code":400,"description":"Bad Request: chat not found"}`))
-	}))
-	defer api.Close()
-
-	bot := telegram.NewWithAPIBase(api.URL, "token")
-	handleMessage(context.Background(), bot, testIdentity, &telegram.Message{
-		MessageID: 555,
-		Text:      "/md@testbot **bold**",
-		Chat:      telegram.Chat{ID: -100, Type: "supergroup"},
-	})
-	for _, path := range paths {
-		if path == "/deleteMessage" {
-			t.Fatalf("original was deleted after a failed send: %v", paths)
-		}
-	}
-}
-
-func TestGroupWithImagesAlsoReplacesTheOriginal(t *testing.T) {
+func TestGroupWithImagesRepliesToTheOriginal(t *testing.T) {
 	images := imageServer(t)
 	defer images.Close()
 	var calls []recordedCall
@@ -669,11 +627,46 @@ func TestGroupWithImagesAlsoReplacesTheOriginal(t *testing.T) {
 		Text:      "/md@testbot ![logo](" + images.URL + "/img.png)",
 		Chat:      telegram.Chat{ID: -100, Type: "supergroup"},
 	})
-	if got := sentCalls(calls); len(got) == 0 || got[0].path != "/sendPhoto" {
+	if len(calls) == 0 || calls[0].path != "/sendPhoto" {
 		t.Fatalf("expected a photo to be sent, got %#v", calls)
 	}
-	if deletedMessage(calls) != 77 {
-		t.Errorf("deleted message = %d, want 77", deletedMessage(calls))
+	if calls[0].replyTo != 77 {
+		t.Errorf("reply target = %d, want 77", calls[0].replyTo)
+	}
+}
+
+func TestHealthServerServesRenderPort(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)
+	_ = listener.Close()
+
+	t.Setenv("PORT", port)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	startHealthServer(ctx)
+
+	deadline := time.Now().Add(2 * time.Second)
+	var resp *http.Response
+	for time.Now().Before(deadline) {
+		resp, err = http.Get("http://127.0.0.1:" + port + "/health")
+		if err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("health request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "ok" {
+		t.Errorf("body = %q, want ok", body)
 	}
 }
 

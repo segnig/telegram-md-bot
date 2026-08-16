@@ -1,0 +1,13 @@
+# Deploy as a Free Web Service on Render.
+# Dashboard alternative: New → Web Service → Free, then set the same build/start/env.
+services:
+  - type: web
+    name: telegram-md-bot
+    runtime: go
+    plan: free
+    buildCommand: go build -o telegram-md-bot .
+    startCommand: ./telegram-md-bot
+    healthCheckPath: /health
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false

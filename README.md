@@ -180,10 +180,7 @@ limit, since it has no legal cut point.
 - Only the addressing prefix is removed from a group message; the document that
   follows reaches the converter unchanged, so a group and a private chat render
   the same input identically.
-- In a group the converted message replaces the original: the bot posts the
-  rendered version and then deletes the source message, which needs the "delete
-  messages" administrator right. The send always precedes the delete, and a
-  failed send cancels it, so the markdown is never lost.
+- In a group the converted answer is sent as a reply to the original message.
 - In a channel the original post is edited in place, when the bot is an
   administrator with the "edit messages" right and the result is text that fits
   one message. Telegram cannot turn a text message into an album, so a post with
@@ -191,6 +188,8 @@ limit, since it has no legal cut point.
   also falls back to a reply.
 - Private chats get a plain message, and command replies such as /help stay
   ordinary replies everywhere.
+- When `PORT` is set (as on Render), a small HTTP health server listens so the
+  process can run as a Free Web Service.
 - Every inbound update is logged with its chat type, entities, and text, and
   ignored group messages say why, so delivery problems are visible in the log.
 - Nested blockquotes are flattened to one level, since Telegram cannot nest them.
@@ -243,12 +242,9 @@ Then message your bot on Telegram — try `/start`, or paste some markdown.
 
 1. Add the bot to the group or channel (for channels it must be an
    administrator with permission to post messages).
-2. In a **group**, promote the bot to administrator and enable **Delete
-   messages**. Without that right the conversion is still posted, but the
-   original markdown stays in the chat.
-3. In a **channel**, promote the bot and enable **Edit messages** so the post
+2. In a **channel**, promote the bot and enable **Edit messages** so the post
    can be rewritten in place.
-4. Send the markdown after a `/md` command, on the same message:
+3. Send the markdown after a `/md` command, on the same message:
 
    ```
    /md@YourBot # Title
@@ -288,28 +284,71 @@ Replying to one of the bot's own messages works either way.
 
 ### Where the answer goes
 
-In a group the bot posts the rendered version and deletes the original message,
-so the markdown appears to turn into its preview. This needs the bot to be an
-administrator with **Delete messages**; without that right the delete is
-refused, the original stays above the answer, and the reason is logged.
+In a group or channel fallback, the bot replies to the message it converted, so
+the answer stays next to its source. Private chats get a plain message.
 
-The bot cannot simply edit the original: the Bot API only lets a bot edit its
-own messages, and the `can_edit_messages` administrator right is channels-only.
-Deleting and reposting is the closest equivalent. The conversion is always sent
-before the delete, so a failure never destroys the only copy of the markdown.
-
-In a **channel** the bot does edit the original post in place, replacing the
-markdown with its rendered form. That needs the bot to be an administrator with
-**Edit messages**, and it only applies to text — a post whose markdown contains
-images or Mermaid diagrams is answered with an attachment reply, because a text
-message cannot be converted into an album. If the edit is refused, the bot
-replies instead rather than dropping the answer.
+In a **channel** the bot edits the original post in place when it is an
+administrator with **Edit messages**, and the result is text that fits one
+message. A post with images or Mermaid is answered as a reply instead.
 
 If a group message is ignored, the log line says so explicitly, including the
 chat type and the text that arrived. If nothing is logged at all, Telegram never
 delivered the update, which means privacy mode is still on.
 
-## 3. Build a binary
+## 3. Deploy on Render (Free Web Service)
+
+This bot can run on Render’s **Free Web Service**. It listens on `$PORT` for
+health checks while long-polling Telegram in the background.
+
+### Limits you must accept
+
+- Free web services **sleep after 15 minutes** with no HTTP traffic. While
+  asleep, the bot stops polling and will not answer until it wakes up.
+- To keep it awake, ping `https://YOUR-SERVICE.onrender.com/health` every
+  5 minutes with a free monitor such as
+  [UptimeRobot](https://uptimerobot.com/) or [cron-job.org](https://cron-job.org/).
+- Free workspaces get **750 instance hours/month**. One always-on service uses
+  about a full month of that budget.
+- Render may restart free services at any time.
+
+### Steps
+
+1. Push this repo to GitHub (public or private).
+2. Sign up at [render.com](https://render.com) with GitHub (no card needed for Free).
+3. Dashboard → **New** → **Web Service** (not Background Worker).
+4. Connect the repository.
+5. Settings:
+
+   | Field | Value |
+   |-------|--------|
+   | Language / Runtime | Go |
+   | Branch | `main` (or your branch) |
+   | Build Command | `go build -o telegram-md-bot .` |
+   | Start Command | `./telegram-md-bot` |
+   | Instance Type | **Free** |
+   | Health Check Path | `/health` |
+
+6. Environment → Add:
+
+   | Key | Value |
+   |-----|--------|
+   | `TELEGRAM_BOT_TOKEN` | token from @BotFather |
+
+7. Create Web Service and wait until the deploy is **Live**.
+8. Open `https://YOUR-SERVICE.onrender.com/health` — it should return `ok`.
+9. Message the bot on Telegram (`/start` or paste markdown).
+10. **Required for 24/7:** create an UptimeRobot HTTP(s) monitor on
+    `https://YOUR-SERVICE.onrender.com/health` every 5 minutes.
+
+Or use the included `render.yaml`: Dashboard → **New** → **Blueprint** →
+select the repo, then fill in `TELEGRAM_BOT_TOKEN`.
+
+### Groups and channels (after deploy)
+
+Same as local: use `/md@YourBot …` in groups. For channels, promote the bot
+with **Edit messages** if you want in-place edits.
+
+## 4. Build a binary
 
 ```bash
 go build -o telegram-md-bot .
@@ -322,7 +361,7 @@ Cross-compile for a Linux server from any machine:
 GOOS=linux GOARCH=amd64 go build -o telegram-md-bot-linux .
 ```
 
-## 4. Run the tests
+## 5. Run the tests
 
 ```bash
 go test ./...
@@ -330,7 +369,7 @@ go test -race ./...
 go vet ./...
 ```
 
-## 5. Deploy (simple systemd example)
+## 6. Deploy (simple systemd example)
 
 ```ini
 # /etc/systemd/system/telegram-md-bot.service
