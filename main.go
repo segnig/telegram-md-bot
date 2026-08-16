@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -107,32 +109,27 @@ func handleMessage(ctx context.Context, bot *telegram.Bot, message *telegram.Mes
 	sendTextReply(ctx, bot, message.Chat.ID, converted)
 }
 
-// sendAlbumReply delivers the whole response as one message: the attached
-// images carry the converted markdown as their caption.
+// sendAlbumReply delivers the response as the attachments plus their caption.
+// Telegram caps a caption far below a message, so text that does not fit
+// continues in follow-up messages rather than being dropped.
 func sendAlbumReply(ctx context.Context, bot *telegram.Bot, chatID int64, converted string, photos []telegram.InputPhoto) {
-	caption := converted
-	captionMode := "MarkdownV2"
-	// Telegram allows far less text in a caption than in a message, so an
-	// oversized preview cannot ride along with the attachments.
-	overflow := utf8.RuneCountInString(caption) > maxTelegramCaption
-	if overflow {
-		caption = ""
-		captionMode = ""
+	caption, rest := "", ""
+	if chunks := converter.Split(converted, maxTelegramCaption); len(chunks) > 0 {
+		caption = chunks[0]
+		rest = strings.Join(chunks[1:], "\n\n")
 	}
 
-	err := sendPhotos(ctx, bot, chatID, photos, caption, captionMode)
+	err := sendPhotos(ctx, bot, chatID, photos, caption, "MarkdownV2")
 	if err != nil && caption != "" {
 		log.Printf("album with MarkdownV2 caption failed: %v", err)
-		err = sendPhotos(ctx, bot, chatID, photos, captionFallback(converted), "")
+		err = sendPhotos(ctx, bot, chatID, photos, captionFallback(caption), "")
 	}
 	if err != nil {
 		log.Printf("sending attachments failed: %v", err)
 		sendTextReply(ctx, bot, chatID, converted)
 		return
 	}
-	if overflow {
-		sendTextReply(ctx, bot, chatID, converted)
-	}
+	sendTextReply(ctx, bot, chatID, rest)
 }
 
 func sendPhotos(ctx context.Context, bot *telegram.Bot, chatID int64, photos []telegram.InputPhoto, caption, parseMode string) error {
@@ -146,36 +143,45 @@ func sendPhotos(ctx context.Context, bot *telegram.Bot, chatID int64, photos []t
 	})
 }
 
-// sendTextReply sends only the rendered MarkdownV2 preview, splitting only
-// when Telegram's length limit leaves no alternative.
+// sendTextReply sends the rendered MarkdownV2 preview, splitting at block
+// boundaries so each part is still valid MarkdownV2 on its own.
 func sendTextReply(ctx context.Context, bot *telegram.Bot, chatID int64, converted string) {
-	if converted == "" {
-		return
-	}
-	if utf8.RuneCountInString(converted) <= maxTelegramText {
-		err := sendWithRetry(ctx, bot, chatID, converted, "MarkdownV2")
+	for _, chunk := range converter.Split(converted, maxTelegramText) {
+		err := sendWithRetry(ctx, bot, chatID, chunk, "MarkdownV2")
 		if err == nil {
-			return
+			continue
 		}
-		log.Printf("preview reply failed: %v", err)
-		_ = sendWithRetry(ctx, bot, chatID, previewFallbackText(err), "")
-		return
-	}
-
-	for _, chunk := range splitRunes(converted, maxTelegramText) {
-		if err := sendWithRetry(ctx, bot, chatID, chunk, ""); err != nil {
-			log.Printf("send preview failed: %v", err)
+		// Rather than losing the part Telegram refused to parse, resend it
+		// unformatted with the escapes stripped.
+		log.Printf("preview reply failed: %v%s", err, offsetContext(chunk, err))
+		if err := sendWithRetry(ctx, bot, chatID, unescape(chunk), ""); err != nil {
+			log.Printf("send fallback failed: %v", err)
 			return
 		}
 	}
 }
 
 func captionFallback(converted string) string {
-	caption := strings.ReplaceAll(converted, "\\", "")
+	caption := unescape(converted)
 	if utf8.RuneCountInString(caption) > maxTelegramCaption {
 		return ""
 	}
 	return caption
+}
+
+// unescape drops the MarkdownV2 backslashes so text can be resent verbatim
+// when Telegram rejects the formatted version.
+func unescape(text string) string {
+	var out strings.Builder
+	out.Grow(len(text))
+	runes := []rune(text)
+	for i := 0; i < len(runes); i++ {
+		if runes[i] == '\\' && i+1 < len(runes) {
+			i++
+		}
+		out.WriteRune(runes[i])
+	}
+	return out.String()
 }
 
 // collectedMedia is the set of uploaded photos for one reply, plus which
@@ -285,6 +291,31 @@ func mermaidEndpoint() string {
 	return converter.DefaultMermaidEndpoint
 }
 
+// byteOffsetRe pulls the position out of Telegram's "can't parse entities:
+// ... at byte offset 123" rejection.
+var byteOffsetRe = regexp.MustCompile(`byte offset (\d+)`)
+
+// offsetContext quotes the text around the byte offset Telegram complained
+// about, which is the piece of information needed to fix an escaping bug.
+func offsetContext(text string, err error) string {
+	var apiErr *telegram.APIError
+	if !errors.As(err, &apiErr) {
+		return ""
+	}
+	match := byteOffsetRe.FindStringSubmatch(apiErr.Description)
+	if match == nil {
+		return ""
+	}
+	offset, convErr := strconv.Atoi(match[1])
+	if convErr != nil || offset > len(text) {
+		return ""
+	}
+	start := max(offset-40, 0)
+	end := min(offset+40, len(text))
+	return fmt.Sprintf(" (around offset %d: %q, message is %d bytes)",
+		offset, text[start:end], len(text))
+}
+
 func previewFallbackText(err error) string {
 	var apiErr *telegram.APIError
 	if errors.As(err, &apiErr) && apiErr.Description != "" {
@@ -319,28 +350,6 @@ func isCommand(text, command string) bool {
 	}
 	name := strings.SplitN(fields[0], "@", 2)[0]
 	return name == "/"+command
-}
-
-func splitRunes(input string, limit int) []string {
-	runes := []rune(input)
-	if len(runes) == 0 {
-		return nil
-	}
-	var result []string
-	for len(runes) > 0 {
-		end := min(limit, len(runes))
-		if end < len(runes) {
-			for i := end; i > end/2; i-- {
-				if runes[i-1] == '\n' {
-					end = i
-					break
-				}
-			}
-		}
-		result = append(result, string(runes[:end]))
-		runes = runes[end:]
-	}
-	return result
 }
 
 func sleepContext(ctx context.Context, delay time.Duration) error {

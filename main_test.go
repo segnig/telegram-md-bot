@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -46,6 +48,7 @@ func imageServer(t *testing.T) *httptest.Server {
 
 type recordedCall struct {
 	path    string
+	text    string
 	caption string
 	mode    string
 	files   int
@@ -60,9 +63,25 @@ func telegramServer(t *testing.T, calls *[]recordedCall) *httptest.Server {
 			method = method[index:]
 		}
 		call := recordedCall{path: method}
-		if err := r.ParseMultipartForm(1 << 20); err == nil && r.MultipartForm != nil {
-			call.caption = r.FormValue("caption")
-			call.mode = r.FormValue("parse_mode")
+		if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+			var payload map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Errorf("decoding %s body: %v", method, err)
+			}
+			call.text, _ = payload["text"].(string)
+			call.caption, _ = payload["caption"].(string)
+			call.mode, _ = payload["parse_mode"].(string)
+			*calls = append(*calls, call)
+			_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":1,"chat":{"id":1}}}`))
+			return
+		}
+		if err := r.ParseMultipartForm(1 << 20); err != nil || r.MultipartForm == nil {
+			_ = r.ParseForm()
+		}
+		call.text = r.FormValue("text")
+		call.caption = r.FormValue("caption")
+		call.mode = r.FormValue("parse_mode")
+		if r.MultipartForm != nil {
 			for _, files := range r.MultipartForm.File {
 				call.files += len(files)
 			}
@@ -164,23 +183,71 @@ func TestTextOnlyReplyIsSingleMessage(t *testing.T) {
 	}
 }
 
-func TestSplitRunesPrefersNewline(t *testing.T) {
-	parts := splitRunes("12345\n67890", 8)
-	if len(parts) != 2 || parts[0] != "12345\n" {
-		t.Errorf("unexpected split: %#v", parts)
+// remoteImageRe points the sample's external images at the local test server.
+var remoteImageRe = regexp.MustCompile(`https://[^)\s]+\.svg`)
+
+func TestEverythingSampleIsDeliveredInFull(t *testing.T) {
+	images := imageServer(t)
+	defer images.Close()
+	var calls []recordedCall
+	api := telegramServer(t, &calls)
+	defer api.Close()
+
+	raw, err := os.ReadFile("testdata/everything.md")
+	if err != nil {
+		t.Fatalf("reading sample: %v", err)
+	}
+	sample := remoteImageRe.ReplaceAllString(string(raw), images.URL+"/img.png")
+
+	t.Setenv("MERMAID_ENDPOINT", images.URL+"/img/")
+	bot := telegram.NewWithAPIBase(api.URL, "token")
+	handleMessage(context.Background(), bot, &telegram.Message{
+		Text: sample,
+		Chat: telegram.Chat{ID: 1},
+	})
+
+	if len(calls) == 0 {
+		t.Fatal("no API calls were made")
+	}
+	if calls[0].path != "/sendMediaGroup" {
+		t.Fatalf("first call = %q, want /sendMediaGroup", calls[0].path)
+	}
+	// Two markdown images plus two Mermaid diagrams.
+	if calls[0].files != 4 {
+		t.Errorf("attached files = %d, want 4", calls[0].files)
+	}
+	if calls[0].mode != "MarkdownV2" {
+		t.Errorf("caption mode = %q, want MarkdownV2", calls[0].mode)
+	}
+	if count := utf8.RuneCountInString(calls[0].caption); count == 0 || count > maxTelegramCaption {
+		t.Errorf("caption has %d runes, limit is %d", count, maxTelegramCaption)
+	}
+
+	delivered := calls[0].caption
+	for _, call := range calls[1:] {
+		if call.path != "/sendMessage" {
+			t.Errorf("follow-up call = %q, want /sendMessage", call.path)
+		}
+		if call.mode != "MarkdownV2" {
+			t.Errorf("follow-up mode = %q, want MarkdownV2", call.mode)
+		}
+		if count := utf8.RuneCountInString(call.text); count > maxTelegramText {
+			t.Errorf("follow-up has %d runes, limit is %d", count, maxTelegramText)
+		}
+		delivered += call.text
+	}
+
+	// Content from the very end of the sample must survive the split.
+	for _, want := range []string{"*Everything sample*", "attached image", "Emoji"} {
+		if !strings.Contains(delivered, want) {
+			t.Errorf("delivered reply is missing %q", want)
+		}
 	}
 }
 
-func TestSplitRunesLimitsUnicodeByRunes(t *testing.T) {
-	input := strings.Repeat("東京", 20)
-	parts := splitRunes(input, 11)
-	for _, part := range parts {
-		if count := utf8.RuneCountInString(part); count > 11 {
-			t.Errorf("part has %d runes, limit is 11: %q", count, part)
-		}
-	}
-	if strings.Join(parts, "") != input {
-		t.Errorf("split content did not round-trip")
+func TestUnescapeDropsBackslashes(t *testing.T) {
+	if got := unescape(`a\-b \\ c\.`); got != `a-b \ c.` {
+		t.Errorf("unescape() = %q", got)
 	}
 }
 

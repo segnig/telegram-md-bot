@@ -135,10 +135,16 @@ func TestUnicodeTableAlignment(t *testing.T) {
 	}
 }
 
-func TestRawHTMLRenderedAsText(t *testing.T) {
-	got := Convert("<strong>unsafe</strong>")
-	if got != `<strong\>unsafe</strong\>` {
-		t.Errorf("expected raw HTML to remain literal text, got %q", got)
+func TestRawHTMLBecomesTelegramFormatting(t *testing.T) {
+	if got := Convert("<strong>unsafe</strong>"); got != "*unsafe*" {
+		t.Errorf("expected HTML to map onto a Telegram entity, got %q", got)
+	}
+}
+
+func TestUnknownHTMLTagStaysLiteral(t *testing.T) {
+	got := Convert("a <custom-tag attr=\"1\">b</custom-tag>")
+	if !strings.Contains(got, `<custom\-tag attr\="1"\>`) {
+		t.Errorf("unknown tag was not kept as text, got %q", got)
 	}
 }
 
@@ -344,5 +350,48 @@ func TestExtractImages(t *testing.T) {
 	}
 	if got[1].Alt != "image" || got[1].URL != "https://cdn.example.com/a.jpg" {
 		t.Errorf("second image = %#v", got[1])
+	}
+}
+
+func TestUnfencedSnippetBecomesCodeBlock(t *testing.T) {
+	got := Convert("## Blocks of code\n\nlet message = 'Hello world';\nalert(message);")
+	want := "*Blocks of code*\n\n```js\nlet message = 'Hello world';\nalert(message);\n```"
+	if strings.TrimSpace(got) != want {
+		t.Errorf("Convert() =\n%q\nwant\n%q", got, want)
+	}
+}
+
+func TestLooksLikeCode(t *testing.T) {
+	code := []string{
+		"let message = 'Hello world';\nalert(message);",
+		"def main():\n    print(\"hi\")",
+		"public static void main(String[] args) {\n  System.out.println(1);\n}",
+		"SELECT id, name\nFROM users;",
+		"count := 0\ncount += 1\nfmt.Println(count)",
+	}
+	for _, snippet := range code {
+		if !looksLikeCode(snippet) {
+			t.Errorf("looksLikeCode(%q) = false, want true", snippet)
+		}
+	}
+
+	prose := []string{
+		"Cost: $5.00 (approx!) - done.",
+		"This web site is using markedjs/marked.",
+		"return to the main menu when finished",
+		"import duties may apply; check with customs.",
+		"Markdown is a lightweight markup language, created in 2004 by John Gruber.",
+	}
+	for _, sentence := range prose {
+		if looksLikeCode(sentence) {
+			t.Errorf("looksLikeCode(%q) = true, want false", sentence)
+		}
+	}
+}
+
+func TestUnfencedSnippetEscapesBackticks(t *testing.T) {
+	got := Convert("run(`a`);")
+	if !strings.Contains(got, "\\`a\\`") {
+		t.Errorf("backticks not escaped inside fence: %q", got)
 	}
 }

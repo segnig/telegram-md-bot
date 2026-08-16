@@ -25,6 +25,7 @@ Telegram API client itself uses only the Go standard library.
 | `~~strike~~`             | `~strike~`                                           |
 | `` `code` ``             | `` `code` `` (unchanged, just escaped internally)    |
 | ` ```lang ... ``` `      | fenced code block, preserved as-is                   |
+| unfenced code paragraph  | detected and wrapped in a code block                 |
 | `# / ## / ...` headers   | `*bold line*` (Telegram has no header entity)        |
 | `- item` / `1. item`     | `• item` / `1\. item`                                |
 | `- [x] task`             | `• ☑ task`                                            |
@@ -37,7 +38,31 @@ Telegram API client itself uses only the Go standard library.
 
 All literal punctuation that MarkdownV2 treats as special
 (`_ * [ ] ( ) ~ \` > # + - = | { } . !` and `\`) is automatically
-backslash-escaped in plain text, per Telegram's spec.
+backslash-escaped in plain text, per Telegram's spec. Escaping is
+context-sensitive: inside code only `` ` `` and `\` are escaped, and inside a
+link target only `)` and `\`, because escaping the rest there would show the
+backslashes to the reader.
+
+### Inline HTML
+
+Markdown often carries a few HTML tags, and Telegram has an equivalent entity
+for most of them, so they are translated instead of shown as literal text:
+
+| HTML                            | Telegram MarkdownV2   |
+|---------------------------------|-----------------------|
+| `<b>`, `<strong>`               | `*bold*`              |
+| `<i>`, `<em>`                   | `_italic_`            |
+| `<u>`, `<ins>`                  | `__underline__`       |
+| `<s>`, `<strike>`, `<del>`      | `~strikethrough~`     |
+| `<code>`                        | `` `code` ``          |
+| `<a href="…">`                  | `[text](…)`           |
+| `<span class="tg-spoiler">`     | `\|\|spoiler\|\|`     |
+| `<br>`, `<br/>`                 | a line break          |
+
+A tag left unclosed is closed automatically, since Telegram rejects a message
+with an unbalanced entity. Tags with no equivalent stay as escaped literal
+text, and HTML character references (`&amp;`, `&lt;`, `&#39;`, `&hellip;`) are
+decoded to the characters they stand for.
 
 Nested and mixed emphasis is parsed recursively, and GFM task lists and
 tables are supported.
@@ -51,6 +76,30 @@ their indentation behind the `>` marker.
 
 Code blocks and tables nested inside a list item are emitted at column zero,
 because Telegram only recognizes a ``` fence at the start of a line.
+
+### Code block detection
+
+Fenced (` ``` `) and indented code blocks are converted to Telegram code blocks
+as expected. In addition, a paragraph that was pasted **without** a fence is
+detected as source and wrapped in one, so a snippet like
+
+    let message = 'Hello world';
+    alert(message);
+
+arrives as a monospaced block instead of escaped prose. Detection is
+deliberately conservative: it requires a majority of code-like lines plus at
+least one unambiguous signal (a line ending in `;` or `{`, a lone brace, an
+operator such as `:=` or `+=`, or a declaration keyword followed by code
+punctuation). Sentences that merely begin with a keyword, such as "return to the
+main menu" or "import duties may apply", stay as text.
+
+When a language can be recognized from the source itself (Go, Python,
+JavaScript, Java, SQL, HTML, JSON, Bash, CSS), the fence is tagged so Telegram
+clients can highlight it. Adjacent paragraphs that look like fragments of the
+same snippet are joined into one block, so a blank line inside pasted source
+does not break it into alternating code and prose. Indentation relative to the
+snippet's common baseline is preserved, which matters for Python and similar
+languages.
 
 ### Mermaid diagrams
 
@@ -78,12 +127,31 @@ is still delivered.
 Telegram imposes limits that shape this behavior:
 
 - A caption may hold 1024 characters, while a text message may hold 4096.
-  If the converted markdown exceeds the caption limit, it is sent as a
-  follow-up message, because it cannot fit alongside the attachments.
+  A reply that fits is always delivered as a single message.
 - A single image uses `sendPhoto`, which is genuinely one message. Several
   images use `sendMediaGroup`, which Telegram delivers as one album.
 - Up to 10 images are attached per reply, each at most 10 MB.
 - SVG images are skipped, since the Bot API rejects them as photos.
+
+### Long documents
+
+Anything longer than those limits has to span several messages, so the text is
+split at block boundaries rather than at an arbitrary character. Every part is
+valid MarkdownV2 on its own, which matters because Telegram parses each message
+independently and rejects one with an unbalanced entity:
+
+- Cuts land between blocks, never inside a link, code span, or escape pair.
+- A code block that must be divided gets its ``` fence (and language tag)
+  repeated around each part.
+- Emphasis still open at a cut is closed at the end of the part and reopened at
+  the start of the next.
+- With attachments, the first part becomes the caption and the rest follow as
+  formatted messages, so nothing is dropped.
+- If Telegram still refuses a part, it is resent unformatted with the escapes
+  stripped instead of being replaced by an error notice.
+
+The one case that cannot be preserved is a single link longer than the whole
+limit, since it has no legal cut point.
 
 ### Reliability behavior
 
@@ -107,10 +175,18 @@ telegram-md-bot/
 ├── main_test.go
 ├── converter/
 │   ├── converter.go         # CommonMark AST -> MarkdownV2 renderer
-│   └── converter_test.go
-└── telegram/
-    ├── client.go             # context-aware Telegram API client
-    └── client_test.go
+│   ├── converter_test.go
+│   ├── code.go              # unfenced snippet detection and language tags
+│   ├── code_test.go
+│   ├── html.go              # inline HTML and character references
+│   ├── html_test.go
+│   ├── split.go             # entity-safe splitting for Telegram's limits
+│   └── split_test.go
+├── telegram/
+│   ├── client.go             # context-aware Telegram API client
+│   └── client_test.go
+└── testdata/
+    └── everything.md         # sample exercising every supported feature
 ```
 
 ## 1. Create the bot

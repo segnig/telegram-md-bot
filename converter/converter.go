@@ -19,6 +19,9 @@ import (
 
 const reservedChars = "_*[]()~`>#+-=|{}.!\\"
 
+// blankLineRe matches the blank lines that cannot occur inside a paragraph.
+var blankLineRe = regexp.MustCompile(`\n{2,}`)
+
 var markdown = goldmark.New(
 	goldmark.WithExtensions(extension.GFM),
 	goldmark.WithParserOptions(parser.WithAutoHeadingID()),
@@ -35,12 +38,18 @@ func Convert(md string) string {
 	return ConvertMermaid(md, nil)
 }
 
+// normalize prepares raw input for the parser: line endings are unified and an
+// orphaned code fence is repaired, so every entry point sees the same document.
+func normalize(md string) []byte {
+	return []byte(repairFences(strings.ReplaceAll(md, "\r\n", "\n")))
+}
+
 // ConvertMermaid is like Convert, but replaces Mermaid diagrams that were
 // successfully attached with a short placeholder naming the attached file.
 // mermaidAttached is parallel to ExtractMermaid: true means that diagram was
 // uploaded and should not appear as raw diagram source in the reply text.
 func ConvertMermaid(md string, mermaidAttached []bool) string {
-	source := []byte(strings.ReplaceAll(md, "\r\n", "\n"))
+	source := normalize(md)
 	doc := markdown.Parser().Parse(text.NewReader(source))
 	seen := 0
 	r := renderer{
@@ -71,7 +80,7 @@ var mermaidHeaderRe = regexp.MustCompile(`^(?:(?:graph|flowchart)\s+(?:TB|TD|BT|
 // ```mermaid fences and from paragraphs that begin with a Mermaid diagram
 // declaration.
 func ExtractMermaid(md string) []string {
-	source := []byte(strings.ReplaceAll(md, "\r\n", "\n"))
+	source := normalize(md)
 	doc := markdown.Parser().Parse(text.NewReader(source))
 	var diagrams []string
 	_ = ast.Walk(doc, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
@@ -115,7 +124,7 @@ func MermaidImageURL(endpoint, diagram string) string {
 // document order. Relative or non-HTTP destinations are skipped because
 // sendPhoto only accepts a public HTTP(S) URL or an uploaded file.
 func ExtractImages(md string) []Image {
-	source := []byte(strings.ReplaceAll(md, "\r\n", "\n"))
+	source := normalize(md)
 	doc := markdown.Parser().Parse(text.NewReader(source))
 	var images []Image
 	_ = ast.Walk(doc, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
@@ -151,10 +160,62 @@ type renderer struct {
 
 func (r renderer) renderBlocks(node ast.Node, depth int) string {
 	var out strings.Builder
-	for n := node; n != nil; n = n.NextSibling() {
+	for n := node; n != nil; {
+		if fence, next, ok := r.mergedCodeParagraphs(n); ok {
+			out.WriteString(fence)
+			out.WriteString("\n\n")
+			n = next
+			continue
+		}
 		out.WriteString(r.renderBlock(n, depth))
+		n = n.NextSibling()
 	}
 	return out.String()
+}
+
+// mergedCodeParagraphs joins a run of paragraphs that together form one pasted
+// snippet into a single code block. A blank line inside pasted source starts a
+// new paragraph, so without this a snippet would come back as alternating code
+// and prose. It returns the fence and the first node that was not consumed.
+func (r renderer) mergedCodeParagraphs(node ast.Node) (string, ast.Node, bool) {
+	first, ok := r.codeParagraphText(node)
+	if !ok {
+		return "", nil, false
+	}
+
+	parts := []string{first}
+	qualified := looksLikeCode(first)
+	next := node.NextSibling()
+	for next != nil {
+		text, ok := r.codeParagraphText(next)
+		if !ok || !looksLikeCodeFragment(text) {
+			break
+		}
+		parts = append(parts, text)
+		qualified = qualified || looksLikeCode(text)
+		next = next.NextSibling()
+	}
+
+	// At least one paragraph in the run has to be unambiguous source.
+	if !qualified {
+		return "", nil, false
+	}
+	return codeFence(strings.Join(parts, "\n\n")), next, true
+}
+
+// codeParagraphText returns the raw source of a paragraph that is a candidate
+// for snippet detection, skipping Mermaid diagrams, which are handled
+// separately.
+func (r renderer) codeParagraphText(node ast.Node) (string, bool) {
+	paragraph, ok := node.(*ast.Paragraph)
+	if !ok || r.isMermaidNode(paragraph) {
+		return "", false
+	}
+	text := strings.TrimRight(indentedSegmentsText(paragraph.Lines(), r.source), "\n")
+	if !looksLikeCodeFragment(text) {
+		return "", false
+	}
+	return text, true
 }
 
 // renderBlock renders a single block node, ignoring its siblings, so nested
@@ -172,7 +233,17 @@ func (r renderer) renderBlock(node ast.Node, depth int) string {
 			out.WriteString("\n\n")
 			break
 		}
-		out.WriteString(r.renderInlineChildren(n))
+		// A paragraph of unfenced source (a snippet pasted without ```) is
+		// far more readable as a code block than as escaped prose.
+		if raw := strings.TrimRight(indentedSegmentsText(n.Lines(), r.source), "\n"); looksLikeCode(raw) {
+			out.WriteString(codeFence(raw))
+			out.WriteString("\n\n")
+			break
+		}
+		// A <br/> adds a newline of its own, which doubles up with the line
+		// break already in the source and would open a gap mid-paragraph.
+		content := blankLineRe.ReplaceAllString(r.renderInlineChildren(n), "\n")
+		out.WriteString(strings.TrimRight(content, " \n"))
 		out.WriteString("\n\n")
 	case *ast.Blockquote:
 		content := strings.TrimSpace(r.renderBlocks(n.FirstChild(), depth))
@@ -214,7 +285,14 @@ func (r renderer) renderBlock(node ast.Node, depth int) string {
 		out.WriteString(r.renderTable(n))
 		out.WriteString("\n\n")
 	case *ast.HTMLBlock:
-		out.WriteString(escapeText(r.blockLines(n.Lines())))
+		raw := strings.TrimRight(r.blockLines(n.Lines()), "\n")
+		// Hand-written markup spanning several lines is source, and reads
+		// far better fenced than as escaped text.
+		if strings.Contains(raw, "\n") && looksLikeCode(raw) {
+			out.WriteString(codeFence(raw))
+		} else {
+			out.WriteString(translateHTMLString(raw))
+		}
 		out.WriteString("\n\n")
 	default:
 		if n.HasChildren() {
@@ -283,10 +361,39 @@ func (r renderer) renderList(list *ast.List, depth int) string {
 
 func (r renderer) renderInlineChildren(parent ast.Node) string {
 	var out strings.Builder
+	// HTML tags arrive as separate inline nodes, so the open ones are tracked
+	// across the whole run of children.
+	html := &htmlState{}
 	for child := parent.FirstChild(); child != nil; child = child.NextSibling() {
+		if raw, ok := child.(*ast.RawHTML); ok {
+			out.WriteString(html.translate(r.rawHTMLText(raw)))
+			continue
+		}
+		if text, ok := child.(*ast.Text); ok && html.inCode() {
+			out.WriteString(escapeCode(decodeEntities(r.textValue(text))))
+			continue
+		}
 		out.WriteString(r.renderInline(child))
 	}
+	out.WriteString(html.closeAll())
 	return out.String()
+}
+
+func (r renderer) rawHTMLText(n *ast.RawHTML) string {
+	var out strings.Builder
+	for i := 0; i < n.Segments.Len(); i++ {
+		segment := n.Segments.At(i)
+		out.Write(segment.Value(r.source))
+	}
+	return out.String()
+}
+
+func (r renderer) textValue(n *ast.Text) string {
+	value := string(n.Segment.Value(r.source))
+	if n.SoftLineBreak() || n.HardLineBreak() {
+		value += "\n"
+	}
+	return value
 }
 
 // mermaidPlaceholderIfAttached returns a MarkdownV2 placeholder when this node
@@ -328,11 +435,7 @@ func (r renderer) isMermaidNode(n ast.Node) bool {
 func (r renderer) renderInline(n ast.Node) string {
 	switch n := n.(type) {
 	case *ast.Text:
-		value := string(n.Segment.Value(r.source))
-		if n.SoftLineBreak() || n.HardLineBreak() {
-			value += "\n"
-		}
-		return escapeText(value)
+		return escapeText(r.textValue(n))
 	case *ast.String:
 		return escapeText(string(n.Value))
 	case *ast.Emphasis:
@@ -354,12 +457,10 @@ func (r renderer) renderInline(n ast.Node) string {
 	case *ast.AutoLink:
 		return renderLink(escapeText(string(n.Label(r.source))), string(n.URL(r.source)))
 	case *ast.RawHTML:
-		var value strings.Builder
-		for i := 0; i < n.Segments.Len(); i++ {
-			segment := n.Segments.At(i)
-			value.Write(segment.Value(r.source))
-		}
-		return escapeText(value.String())
+		// Reached only outside renderInlineChildren, where no surrounding
+		// tag state exists, so the tag stands alone.
+		state := &htmlState{}
+		return state.translate(r.rawHTMLText(n)) + state.closeAll()
 	case *extensionast.Strikethrough:
 		return "~" + r.renderInlineChildren(n) + "~"
 	case *extensionast.TaskCheckBox:
@@ -395,6 +496,22 @@ func segmentsText(lines *text.Segments, source []byte) string {
 	for i := 0; i < lines.Len(); i++ {
 		segment := lines.At(i)
 		out.Write(segment.Value(source))
+	}
+	return out.String()
+}
+
+// indentedSegmentsText is segmentsText with the leading whitespace the parser
+// strips from paragraph continuation lines put back. Indentation is meaningful
+// in a pasted code snippet, and in Python it is the syntax.
+func indentedSegmentsText(lines *text.Segments, source []byte) string {
+	var out strings.Builder
+	for i := 0; i < lines.Len(); i++ {
+		segment := lines.At(i)
+		start := segment.Start
+		for start > 0 && (source[start-1] == ' ' || source[start-1] == '\t') {
+			start--
+		}
+		out.Write(source[start:segment.Stop])
 	}
 	return out.String()
 }
@@ -469,6 +586,9 @@ func plainText(n ast.Node, source []byte) string {
 }
 
 func escapeText(s string) string {
+	// "&amp;" and friends are markup in the source, and reach the reader as
+	// the character they stand for.
+	s = decodeEntities(s)
 	var out strings.Builder
 	out.Grow(len(s) + 8)
 	for _, char := range s {
