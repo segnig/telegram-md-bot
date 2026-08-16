@@ -152,7 +152,7 @@ func TestCodeBlockPipeline(t *testing.T) {
 			defer api.Close()
 
 			bot := telegram.NewWithAPIBase(api.URL, "token")
-			handleMessage(context.Background(), bot, &telegram.Message{
+			handleMessage(context.Background(), bot, testIdentity, &telegram.Message{
 				Text: test.md,
 				Chat: telegram.Chat{ID: 1},
 			})

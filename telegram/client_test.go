@@ -16,6 +16,35 @@ func testBot(server *httptest.Server) *Bot {
 	return &Bot{client: server.Client(), apiBase: server.URL}
 }
 
+func TestTransportErrorsRedactToken(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Fatal("hijacking unsupported")
+		}
+		conn, _, err := hj.Hijack()
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = conn.Close()
+	}))
+	defer server.Close()
+
+	token := "123456:SECRET-TOKEN-VALUE"
+	bot := NewWithAPIBase(server.URL, token)
+	bot.client = server.Client()
+	err := bot.SendMessage(context.Background(), 1, "hi", "")
+	if err == nil {
+		t.Fatal("expected transport error")
+	}
+	if strings.Contains(err.Error(), token) {
+		t.Errorf("token leaked in error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "***") {
+		t.Errorf("expected redacted token marker, got: %v", err)
+	}
+}
+
 func TestGetUpdates(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.URL.Query().Get("offset"); got != "42" {
@@ -168,5 +197,46 @@ func TestRequestCancellation(t *testing.T) {
 	err := testBot(server).SendMessage(ctx, 99, "hello", "")
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context cancellation, got %v", err)
+	}
+}
+
+func TestGetMe(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/getMe") {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"ok":true,"result":{"id":1,"is_bot":true,"first_name":"Md","username":"MdBot"}}`))
+	}))
+	defer server.Close()
+
+	me, err := testBot(server).GetMe(context.Background())
+	if err != nil {
+		t.Fatalf("GetMe: %v", err)
+	}
+	if me.Username != "MdBot" || !me.IsBot {
+		t.Errorf("unexpected identity: %#v", me)
+	}
+}
+
+func TestIncomingMessagePrefersEditedChannelPost(t *testing.T) {
+	update := Update{EditedChannelPost: &Message{Text: "edited"}}
+	if got := update.IncomingMessage(); got == nil || got.Text != "edited" {
+		t.Errorf("IncomingMessage() = %#v", got)
+	}
+}
+
+func TestChatIsGroupOrChannel(t *testing.T) {
+	for _, test := range []struct {
+		kind string
+		want bool
+	}{
+		{"private", false},
+		{"group", true},
+		{"supergroup", true},
+		{"channel", true},
+	} {
+		if got := (Chat{Type: test.kind}).IsGroupOrChannel(); got != test.want {
+			t.Errorf("type %q: got %v, want %v", test.kind, got, test.want)
+		}
 	}
 }

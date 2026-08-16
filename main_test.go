@@ -15,6 +15,8 @@ import (
 	"telegram-md-bot/telegram"
 )
 
+var testIdentity = botIdentity{Username: "testbot", ID: 4242}
+
 func TestIsCommand(t *testing.T) {
 	tests := []struct {
 		text string
@@ -117,7 +119,7 @@ func TestMermaidReplyIsSingleAttachedMessage(t *testing.T) {
 		Chat: telegram.Chat{ID: 1},
 	}
 
-	handleMessage(context.Background(), bot, message)
+	handleMessage(context.Background(), bot, testIdentity, message)
 
 	if len(calls) != 1 {
 		t.Fatalf("got %d API calls, want exactly 1: %#v", len(calls), calls)
@@ -153,7 +155,7 @@ func TestMultipleImagesBecomeSingleAlbum(t *testing.T) {
 		Chat: telegram.Chat{ID: 1},
 	}
 
-	handleMessage(context.Background(), bot, message)
+	handleMessage(context.Background(), bot, testIdentity, message)
 
 	if len(calls) != 1 {
 		t.Fatalf("got %d API calls, want exactly 1: %#v", len(calls), calls)
@@ -174,7 +176,7 @@ func TestTextOnlyReplyIsSingleMessage(t *testing.T) {
 	bot := telegram.NewWithAPIBase(api.URL, "token")
 	message := &telegram.Message{Text: "# Title\n\nsome **bold** text", Chat: telegram.Chat{ID: 1}}
 
-	handleMessage(context.Background(), bot, message)
+	handleMessage(context.Background(), bot, testIdentity, message)
 
 	if len(calls) != 1 {
 		t.Fatalf("got %d API calls, want exactly 1: %#v", len(calls), calls)
@@ -202,7 +204,7 @@ func TestEverythingSampleIsDeliveredInFull(t *testing.T) {
 
 	t.Setenv("MERMAID_ENDPOINT", images.URL+"/img/")
 	bot := telegram.NewWithAPIBase(api.URL, "token")
-	handleMessage(context.Background(), bot, &telegram.Message{
+	handleMessage(context.Background(), bot, testIdentity, &telegram.Message{
 		Text: sample,
 		Chat: telegram.Chat{ID: 1},
 	})
@@ -319,7 +321,7 @@ func TestSVGImageReachesTheAlbum(t *testing.T) {
 
 	t.Setenv("SVG_RENDER_ENDPOINT", origin.URL+"/render?url=")
 	bot := telegram.NewWithAPIBase(api.URL, "token")
-	handleMessage(context.Background(), bot, &telegram.Message{
+	handleMessage(context.Background(), bot, testIdentity, &telegram.Message{
 		Text: "![logo](" + origin.URL + "/logo.svg)",
 		Chat: telegram.Chat{ID: 1},
 	})
@@ -382,5 +384,368 @@ func TestCaptionFallbackDropsEscapes(t *testing.T) {
 func TestCaptionFallbackRejectsOversized(t *testing.T) {
 	if got := captionFallback(strings.Repeat("a", maxTelegramCaption+1)); got != "" {
 		t.Errorf("expected empty caption for oversized input, got %d runes", utf8.RuneCountInString(got))
+	}
+}
+
+func TestPrivateChatWorksWithoutMention(t *testing.T) {
+	var calls []recordedCall
+	api := telegramServer(t, &calls)
+	defer api.Close()
+
+	bot := telegram.NewWithAPIBase(api.URL, "token")
+	handleMessage(context.Background(), bot, testIdentity, &telegram.Message{
+		Text: "**bold**",
+		Chat: telegram.Chat{ID: 1, Type: "private"},
+	})
+	if len(calls) != 1 {
+		t.Fatalf("got %d calls, want 1", len(calls))
+	}
+}
+
+func TestGroupIgnoresUnmentionedMessage(t *testing.T) {
+	var calls []recordedCall
+	api := telegramServer(t, &calls)
+	defer api.Close()
+
+	bot := telegram.NewWithAPIBase(api.URL, "token")
+	handleMessage(context.Background(), bot, testIdentity, &telegram.Message{
+		Text: "**bold**",
+		Chat: telegram.Chat{ID: -100, Type: "supergroup"},
+	})
+	if len(calls) != 0 {
+		t.Fatalf("unmentioned group message was handled: %#v", calls)
+	}
+}
+
+func TestGroupRespondsToMention(t *testing.T) {
+	var calls []recordedCall
+	api := telegramServer(t, &calls)
+	defer api.Close()
+
+	bot := telegram.NewWithAPIBase(api.URL, "token")
+	text := "@testbot **bold**"
+	handleMessage(context.Background(), bot, testIdentity, &telegram.Message{
+		Text: text,
+		Chat: telegram.Chat{ID: -100, Type: "supergroup"},
+		Entities: []telegram.MessageEntity{{
+			Type:   "mention",
+			Offset: 0,
+			Length: len("@testbot"),
+		}},
+	})
+	if len(calls) != 1 {
+		t.Fatalf("got %d calls, want 1: %#v", len(calls), calls)
+	}
+	if strings.Contains(calls[0].text, "testbot") {
+		t.Errorf("mention should be stripped from reply, got %q", calls[0].text)
+	}
+	if !strings.Contains(calls[0].text, "*bold*") {
+		t.Errorf("converted text missing: %q", calls[0].text)
+	}
+}
+
+func TestChannelRespondsToMention(t *testing.T) {
+	var calls []recordedCall
+	api := telegramServer(t, &calls)
+	defer api.Close()
+
+	bot := telegram.NewWithAPIBase(api.URL, "token")
+	handleMessage(context.Background(), bot, testIdentity, &telegram.Message{
+		Text: "@TestBot # Title",
+		Chat: telegram.Chat{ID: -200, Type: "channel"},
+		Entities: []telegram.MessageEntity{{
+			Type:   "mention",
+			Offset: 0,
+			Length: len("@TestBot"),
+		}},
+	})
+	if len(calls) != 1 {
+		t.Fatalf("got %d calls, want 1", len(calls))
+	}
+	if !strings.Contains(calls[0].text, "*Title*") {
+		t.Errorf("channel conversion missing: %q", calls[0].text)
+	}
+}
+
+func TestGroupRespondsToReply(t *testing.T) {
+	var calls []recordedCall
+	api := telegramServer(t, &calls)
+	defer api.Close()
+
+	bot := telegram.NewWithAPIBase(api.URL, "token")
+	handleMessage(context.Background(), bot, testIdentity, &telegram.Message{
+		Text: "*italic*",
+		Chat: telegram.Chat{ID: -100, Type: "group"},
+		ReplyToMessage: &telegram.Message{
+			From: &telegram.User{Username: "testbot", IsBot: true},
+		},
+	})
+	if len(calls) != 1 {
+		t.Fatalf("reply to bot was ignored: %#v", calls)
+	}
+}
+
+func TestStripBotMentionPreservesEmojiOffsets(t *testing.T) {
+	text := "🚀 @testbot **hi**"
+	// rocket is one rune but two UTF-16 units, followed by space (1) then @testbot (8).
+	got := stripBotMention(text, []telegram.MessageEntity{{
+		Type:   "mention",
+		Offset: 3,
+		Length: 8,
+	}}, "testbot")
+	if got != "🚀  **hi**" && got != "🚀 **hi**" {
+		// TrimSpace may collapse the trailing space next to the emoji differently.
+		if !strings.Contains(got, "🚀") || !strings.Contains(got, "**hi**") || strings.Contains(got, "testbot") {
+			t.Errorf("stripBotMention() = %q", got)
+		}
+	}
+}
+
+func TestGroupConvertCommandWorksWithoutMention(t *testing.T) {
+	var calls []recordedCall
+	api := telegramServer(t, &calls)
+	defer api.Close()
+
+	bot := telegram.NewWithAPIBase(api.URL, "token")
+	handleMessage(context.Background(), bot, testIdentity, &telegram.Message{
+		Text: "/md@testbot # Title\n**bold**",
+		Chat: telegram.Chat{ID: -100, Type: "supergroup"},
+		Entities: []telegram.MessageEntity{{
+			Type:   "bot_command",
+			Offset: 0,
+			Length: len("/md@testbot"),
+		}},
+	})
+	if len(calls) != 1 {
+		t.Fatalf("got %d calls, want 1: %#v", len(calls), calls)
+	}
+	if !strings.Contains(calls[0].text, "*Title*") || !strings.Contains(calls[0].text, "*bold*") {
+		t.Errorf("converted text missing: %q", calls[0].text)
+	}
+	if strings.Contains(calls[0].text, "/md") {
+		t.Errorf("command should be stripped, got %q", calls[0].text)
+	}
+}
+
+func TestBareConvertCommandExplainsUsage(t *testing.T) {
+	var calls []recordedCall
+	api := telegramServer(t, &calls)
+	defer api.Close()
+
+	bot := telegram.NewWithAPIBase(api.URL, "token")
+	handleMessage(context.Background(), bot, testIdentity, &telegram.Message{
+		Text: "/md@testbot",
+		Chat: telegram.Chat{ID: -100, Type: "supergroup"},
+	})
+	if len(calls) != 1 {
+		t.Fatalf("got %d calls, want 1", len(calls))
+	}
+	if !strings.Contains(calls[0].text, "/md@testbot") {
+		t.Errorf("usage should name the bot: %q", calls[0].text)
+	}
+}
+
+// A group message must reach the converter as the same document a private chat
+// would deliver: only the addressing prefix may differ.
+func TestGroupParsesExactlyLikePrivateChat(t *testing.T) {
+	images := imageServer(t)
+	defer images.Close()
+	t.Setenv("MERMAID_ENDPOINT", images.URL+"/img/")
+
+	raw, err := os.ReadFile("testdata/everything.md")
+	if err != nil {
+		t.Fatalf("reading sample: %v", err)
+	}
+	sample := remoteImageRe.ReplaceAllString(string(raw), images.URL+"/img.png")
+
+	deliver := func(message *telegram.Message) []string {
+		var calls []recordedCall
+		api := telegramServer(t, &calls)
+		defer api.Close()
+
+		bot := telegram.NewWithAPIBase(api.URL, "token")
+		handleMessage(context.Background(), bot, testIdentity, message)
+		sent := make([]string, 0, len(calls))
+		for _, call := range calls {
+			sent = append(sent, call.caption+call.text)
+		}
+		return sent
+	}
+
+	private := deliver(&telegram.Message{
+		Text: sample,
+		Chat: telegram.Chat{ID: 1, Type: "private"},
+	})
+	if len(private) == 0 {
+		t.Fatal("private chat produced no output")
+	}
+
+	groups := []struct {
+		name    string
+		message *telegram.Message
+	}{
+		{"mention", &telegram.Message{
+			Text: "@testbot\n" + sample,
+			Chat: telegram.Chat{ID: -100, Type: "supergroup"},
+			Entities: []telegram.MessageEntity{{
+				Type:   "mention",
+				Offset: 0,
+				Length: len("@testbot"),
+			}},
+		}},
+		{"command", &telegram.Message{
+			Text: "/md@testbot\n" + sample,
+			Chat: telegram.Chat{ID: -100, Type: "supergroup"},
+			Entities: []telegram.MessageEntity{{
+				Type:   "bot_command",
+				Offset: 0,
+				Length: len("/md@testbot"),
+			}},
+		}},
+	}
+	for _, group := range groups {
+		got := deliver(group.message)
+		if len(got) != len(private) {
+			t.Fatalf("%s sent %d messages, private chat sent %d", group.name, len(got), len(private))
+		}
+		for i := range private {
+			if got[i] != private[i] {
+				t.Errorf("%s message %d differs from private chat\ngroup:   %q\nprivate: %q",
+					group.name, i, got[i], private[i])
+			}
+		}
+	}
+}
+
+// An address prefix on its own line must not disturb the body, including a
+// leading indented code block or a trailing blank line, both of which change
+// how the markdown parses.
+func TestAddressPrefixKeepsBodyIndentation(t *testing.T) {
+	body := "    indented code\n\ntext\n\n* item\n    * nested\n"
+	tests := []struct {
+		name string
+		got  string
+	}{
+		{"command on its own line", mustCommandArgument(t, "/md@testbot\n"+body)},
+		{"command with trailing space before the break", mustCommandArgument(t, "/md@testbot  \n"+body)},
+		{"mention on its own line", stripBotMention("@testbot\n"+body, []telegram.MessageEntity{{
+			Type:   "mention",
+			Offset: 0,
+			Length: len("@testbot"),
+		}}, "testbot")},
+	}
+	for _, test := range tests {
+		if test.got != body {
+			t.Errorf("%s:\ngot  %q\nwant %q", test.name, test.got, body)
+		}
+	}
+}
+
+// On a single line the separator is indistinguishable from indentation, so the
+// one-line form is only expected to preserve ordinary markdown.
+func TestSingleLineCommandKeepsBody(t *testing.T) {
+	body := "# Title with **bold** and `code`"
+	if got := mustCommandArgument(t, "/md@testbot "+body); got != body {
+		t.Errorf("got %q, want %q", got, body)
+	}
+}
+
+func mustCommandArgument(t *testing.T, text string) string {
+	t.Helper()
+	argument, ok := commandArgument(text, convertCommands...)
+	if !ok {
+		t.Fatalf("commandArgument(%q) did not match a command", text)
+	}
+	return argument
+}
+
+func TestMentionInsideDocumentIsKept(t *testing.T) {
+	text := "# Title\n\nPing @testbot inside the body.\n\nMore text."
+	got := stripBotMention(text, []telegram.MessageEntity{{
+		Type:   "mention",
+		Offset: len("# Title\n\nPing "),
+		Length: len("@testbot"),
+	}}, "testbot")
+	if got != text {
+		t.Errorf("mention inside the document was altered\ngot:  %q\nwant: %q", got, text)
+	}
+}
+
+func TestTrailingMentionIsStripped(t *testing.T) {
+	text := "# Title\n\nbody @testbot"
+	got := stripBotMention(text, []telegram.MessageEntity{{
+		Type:   "mention",
+		Offset: len("# Title\n\nbody "),
+		Length: len("@testbot"),
+	}}, "testbot")
+	if got != "# Title\n\nbody" {
+		t.Errorf("stripBotMention() = %q", got)
+	}
+}
+
+func TestCommandArgument(t *testing.T) {
+	tests := []struct {
+		text string
+		want string
+		ok   bool
+	}{
+		{"/md **bold**", "**bold**", true},
+		{"/md@testbot **bold**", "**bold**", true},
+		{"/MD@TestBot hi", "hi", true},
+		{"/md\n# Title\nbody", "# Title\nbody", true},
+		{"/convert x", "x", true},
+		{"/md", "", true},
+		{"/mdx hi", "", false},
+		{"not a command /md hi", "", false},
+		{"", "", false},
+	}
+	for _, test := range tests {
+		got, ok := commandArgument(test.text, convertCommands...)
+		if ok != test.ok || got != test.want {
+			t.Errorf("commandArgument(%q) = (%q, %v), want (%q, %v)", test.text, got, ok, test.want, test.ok)
+		}
+	}
+}
+
+func TestReplyToBotMatchedByID(t *testing.T) {
+	message := &telegram.Message{
+		Text: "*italic*",
+		Chat: telegram.Chat{Type: "supergroup"},
+		ReplyToMessage: &telegram.Message{
+			From: &telegram.User{ID: testIdentity.ID, IsBot: true},
+		},
+	}
+	if !addressedToBot(message, testIdentity) {
+		t.Fatal("reply to the bot's own id should address the bot")
+	}
+}
+
+func TestCommandForAnotherBotIsIgnored(t *testing.T) {
+	message := &telegram.Message{
+		Text: "/md@otherbot hi",
+		Chat: telegram.Chat{Type: "supergroup"},
+		Entities: []telegram.MessageEntity{{
+			Type:   "bot_command",
+			Offset: 0,
+			Length: len("/md@otherbot"),
+		}},
+	}
+	if addressedToBot(message, testIdentity) {
+		t.Fatal("a command aimed at another bot should not address us")
+	}
+}
+
+func TestAddressedToBotCommandInGroup(t *testing.T) {
+	message := &telegram.Message{
+		Text: "/help@testbot",
+		Chat: telegram.Chat{Type: "supergroup"},
+		Entities: []telegram.MessageEntity{{
+			Type:   "bot_command",
+			Offset: 0,
+			Length: len("/help@testbot"),
+		}},
+	}
+	if !addressedToBot(message, testIdentity) {
+		t.Fatal("command@bot should address the bot")
 	}
 }

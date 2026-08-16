@@ -38,8 +38,17 @@ const (
 )
 
 const welcomeText = "Send me CommonMark or GitHub-Flavored Markdown and I'll convert it to Telegram MarkdownV2.\n\n" +
+	"In a private chat, just paste markdown.\n\n" +
+	"In a group or channel, start the message with /md@the_bot followed by your markdown:\n\n" +
+	"/md@the_bot **bold** and `code`\n\n" +
+	"Mentioning me or replying to one of my messages also works, but only if privacy mode " +
+	"is disabled for me in @BotFather (/setprivacy, then re-add me to the group).\n\n" +
 	"Supported features include nested emphasis, links, images, task lists, blockquotes, fenced code, and tables. " +
 	"Markdown images and Mermaid diagrams are uploaded as attachments in the same reply."
+
+const commandUsageText = "Send the markdown after the command, on the same message:\n\n" +
+	"/md@the_bot # Title\n**bold** and `code`\n\n" +
+	"The markdown may span as many lines as you like."
 
 func main() {
 	token := strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN"))
@@ -57,9 +66,21 @@ func main() {
 }
 
 func run(ctx context.Context, bot *telegram.Bot) error {
+	me, err := bot.GetMe(ctx)
+	if err != nil {
+		return fmt.Errorf("getMe: %w", err)
+	}
+	username := strings.ToLower(me.Username)
+	if username == "" {
+		return errors.New("bot has no username; set one with @BotFather")
+	}
+	identity := botIdentity{Username: username, ID: me.ID}
+
 	offset := 0
 	backoff := time.Second
-	log.Println("bot started, polling for updates")
+	log.Printf("bot started as @%s (id %d), polling for updates", username, me.ID)
+	log.Printf("in groups/channels use: /md@%s <your markdown>", username)
+	log.Printf("(a plain @%s mention only arrives if privacy mode is disabled in @BotFather)", username)
 
 	for {
 		updates, err := bot.GetUpdates(ctx, offset)
@@ -84,10 +105,11 @@ func run(ctx context.Context, bot *telegram.Bot) error {
 		for _, update := range updates {
 			offset = update.UpdateID + 1
 			message := update.IncomingMessage()
-			if message == nil || strings.TrimSpace(message.Text) == "" {
+			logUpdate(update.UpdateID, message)
+			if message == nil || strings.TrimSpace(message.Content()) == "" {
 				continue
 			}
-			handleMessage(ctx, bot, message)
+			handleMessage(ctx, bot, identity, message)
 			if ctx.Err() != nil {
 				return nil
 			}
@@ -95,16 +117,51 @@ func run(ctx context.Context, bot *telegram.Bot) error {
 	}
 }
 
-func handleMessage(ctx context.Context, bot *telegram.Bot, message *telegram.Message) {
-	if isCommand(message.Text, "start") || isCommand(message.Text, "help") {
-		if err := sendWithRetry(ctx, bot, message.Chat.ID, welcomeText, ""); err != nil {
-			log.Printf("send welcome failed: %v", err)
+// botIdentity is the bot's own Telegram account, used to recognize mentions and
+// replies in groups and channels.
+type botIdentity struct {
+	Username string
+	ID       int64
+}
+
+func handleMessage(ctx context.Context, bot *telegram.Bot, identity botIdentity, message *telegram.Message) {
+	content := message.Content()
+
+	// An explicit /md command is always delivered, even in a group with
+	// privacy mode on, so it is honored before any addressing rules.
+	if argument, ok := commandArgument(content, convertCommands...); ok {
+		if strings.TrimSpace(argument) == "" {
+			usage := strings.ReplaceAll(commandUsageText, "@the_bot", "@"+identity.Username)
+			if err := sendWithRetry(ctx, bot, message.Chat.ID, usage, ""); err != nil {
+				log.Printf("send usage failed (chat %d): %v", message.Chat.ID, err)
+			}
+			return
+		}
+		content = argument
+	} else if message.Chat.IsGroupOrChannel() {
+		if !addressedToBot(message, identity) {
+			log.Printf("ignoring %s chat %d: not addressed to @%s (text=%q)",
+				message.Chat.Type, message.Chat.ID, identity.Username, truncateForLog(content, 80))
+			return
+		}
+		content = stripBotMention(content, message.ContentEntities(), identity.Username)
+		log.Printf("handling %s chat %d from mention/reply (text=%q)",
+			message.Chat.Type, message.Chat.ID, truncateForLog(content, 80))
+	}
+	if strings.TrimSpace(content) == "" {
+		return
+	}
+
+	if isCommand(content, "start") || isCommand(content, "help") {
+		welcome := strings.ReplaceAll(welcomeText, "@the_bot", "@"+identity.Username)
+		if err := sendWithRetry(ctx, bot, message.Chat.ID, welcome, ""); err != nil {
+			log.Printf("send welcome failed (chat %d): %v", message.Chat.ID, err)
 		}
 		return
 	}
 
-	media := collectPhotos(ctx, message.Text)
-	converted := converter.ConvertMermaid(message.Text, media.MermaidAttached)
+	media := collectPhotos(ctx, content)
+	converted := converter.ConvertMermaid(content, media.MermaidAttached)
 	if converted == "" && len(media.Photos) == 0 {
 		return
 	}
@@ -114,6 +171,196 @@ func handleMessage(ctx context.Context, bot *telegram.Bot, message *telegram.Mes
 		return
 	}
 	sendTextReply(ctx, bot, message.Chat.ID, converted)
+}
+
+// logUpdate records every inbound chat so group/channel delivery problems are
+// visible without guessing whether Telegram forwarded the update.
+func logUpdate(updateID int, message *telegram.Message) {
+	if message == nil {
+		log.Printf("update %d: no message payload", updateID)
+		return
+	}
+	entities := make([]string, 0, len(message.ContentEntities()))
+	for _, entity := range message.ContentEntities() {
+		entities = append(entities, entity.Type)
+	}
+	log.Printf("update %d: chat=%d type=%s entities=%v text=%q",
+		updateID, message.Chat.ID, message.Chat.Type, entities, truncateForLog(message.Content(), 100))
+}
+
+func truncateForLog(text string, limit int) string {
+	runes := []rune(strings.ReplaceAll(text, "\n", "\\n"))
+	if len(runes) <= limit {
+		return string(runes)
+	}
+	return string(runes[:limit]) + "…"
+}
+
+// addressedToBot reports whether a group or channel message is meant for this
+// bot: an @mention, a /command@bot, or a reply to one of its messages.
+func addressedToBot(message *telegram.Message, identity botIdentity) bool {
+	if replied := message.ReplyToMessage; replied != nil && replied.From != nil {
+		if replied.From.ID == identity.ID ||
+			strings.EqualFold(replied.From.Username, identity.Username) {
+			return true
+		}
+	}
+	for _, entity := range message.ContentEntities() {
+		switch entity.Type {
+		case "mention":
+			mention := utf16Slice(message.Content(), entity.Offset, entity.Length)
+			if strings.EqualFold(mention, "@"+identity.Username) {
+				return true
+			}
+		case "text_mention":
+			// A mention without a username carries the account itself.
+			if entity.User != nil && (entity.User.ID == identity.ID ||
+				strings.EqualFold(entity.User.Username, identity.Username)) {
+				return true
+			}
+		case "bot_command":
+			command := utf16Slice(message.Content(), entity.Offset, entity.Length)
+			if at := strings.Index(command, "@"); at >= 0 {
+				if strings.EqualFold(command[at+1:], identity.Username) {
+					return true
+				}
+				continue
+			}
+			// A bare /command in a group is delivered to every bot, so it
+			// counts as addressed only when no other bot was named.
+			return true
+		}
+	}
+	// Fallback for hosts that omit entities: look for @username in the text.
+	return strings.Contains(strings.ToLower(message.Content()), "@"+identity.Username)
+}
+
+// convertCommands are the commands that carry markdown to convert. Telegram's
+// privacy mode always delivers commands to a bot, while a plain @mention in a
+// group may never arrive, so this is the reliable way to reach the bot there.
+var convertCommands = []string{"md", "convert", "markdown"}
+
+// commandArgument returns the text following a leading /command, and whether
+// one of the given commands was used. "/md@thebot **hi**" yields "**hi**".
+func commandArgument(text string, commands ...string) (string, bool) {
+	trimmed := strings.TrimLeft(text, " \t")
+	if !strings.HasPrefix(trimmed, "/") {
+		return "", false
+	}
+	first, rest := trimmed, ""
+	if index := strings.IndexAny(trimmed, " \t\n"); index >= 0 {
+		first, rest = trimmed[:index], trimmed[index:]
+	}
+	name := strings.TrimPrefix(strings.SplitN(first, "@", 2)[0], "/")
+	for _, command := range commands {
+		if strings.EqualFold(name, command) {
+			return consumeSeparator(rest), true
+		}
+	}
+	return "", false
+}
+
+// consumeSeparator drops only the whitespace that separated an addressing
+// prefix from the document: spaces and tabs on the prefix's own line plus at
+// most one line break. Indentation on the first body line survives, so an
+// indented code block still parses the way it would in a private chat.
+func consumeSeparator(text string) string {
+	text = strings.TrimLeft(text, " \t")
+	text = strings.TrimPrefix(text, "\r")
+	return strings.TrimPrefix(text, "\n")
+}
+
+// stripBotMention removes the @mention that addresses the bot, leaving the rest
+// of the message untouched so the converter sees the same document a private
+// chat would deliver.
+func stripBotMention(text string, entities []telegram.MessageEntity, username string) string {
+	runes := []rune(text)
+	units := utf16Units(text)
+	needle := "@" + username
+	for _, entity := range entities {
+		if entity.Type != "mention" {
+			continue
+		}
+		if !strings.EqualFold(utf16Slice(text, entity.Offset, entity.Length), needle) {
+			continue
+		}
+		start := utf16IndexToRune(units, entity.Offset)
+		end := utf16IndexToRune(units, entity.Offset+entity.Length)
+		if start < 0 || end < 0 || start >= end || end > len(runes) {
+			continue
+		}
+		if stripped, ok := removeAddress(runes, start, end); ok {
+			return stripped
+		}
+	}
+	// Some clients omit entities; fall back to a textual match.
+	index := strings.Index(strings.ToLower(text), strings.ToLower(needle))
+	if index < 0 {
+		return text
+	}
+	start := utf8.RuneCountInString(text[:index])
+	if stripped, ok := removeAddress(runes, start, start+utf8.RuneCountInString(needle)); ok {
+		return stripped
+	}
+	return text
+}
+
+// removeAddress deletes a mention that merely addresses the bot, meaning one on
+// the message's first or last line. A mention in the middle of the document is
+// part of the content and is kept, along with every other byte around it.
+func removeAddress(runes []rune, start, end int) (string, bool) {
+	before, after := string(runes[:start]), string(runes[end:])
+	if strings.Contains(before, "\n") && strings.Contains(after, "\n") {
+		return "", false
+	}
+	switch {
+	case before == "" || strings.HasSuffix(before, "\n"):
+		return before + consumeSeparator(after), true
+	case after == "" || strings.HasPrefix(after, "\n") || strings.HasPrefix(after, "\r"):
+		return strings.TrimRight(before, " \t") + after, true
+	default:
+		// Mention sat between words: close the gap it leaves behind.
+		return before + strings.TrimLeft(after, " \t"), true
+	}
+}
+
+// utf16Units returns the UTF-16 code unit count of each rune, matching the
+// offsets Telegram uses in MessageEntity.
+func utf16Units(s string) []int {
+	units := make([]int, 0, len(s))
+	for _, r := range s {
+		if r > 0xFFFF {
+			units = append(units, 2)
+		} else {
+			units = append(units, 1)
+		}
+	}
+	return units
+}
+
+func utf16IndexToRune(units []int, offset int) int {
+	at := 0
+	for i, size := range units {
+		if at == offset {
+			return i
+		}
+		at += size
+	}
+	if at == offset {
+		return len(units)
+	}
+	return -1
+}
+
+func utf16Slice(s string, offset, length int) string {
+	runes := []rune(s)
+	units := utf16Units(s)
+	start := utf16IndexToRune(units, offset)
+	end := utf16IndexToRune(units, offset+length)
+	if start < 0 || end < 0 || start > end || end > len(runes) {
+		return ""
+	}
+	return string(runes[start:end])
 }
 
 // sendAlbumReply delivers the response as the attachments plus their caption.

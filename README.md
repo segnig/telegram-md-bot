@@ -172,7 +172,16 @@ limit, since it has no legal cut point.
 - Telegram rate limits (`retry_after`) are honored and retried once.
 - Polling failures use bounded exponential backoff.
 - `SIGINT` and `SIGTERM` cancel in-flight HTTP requests and shut down cleanly.
-- Messages, edited messages, and channel posts are accepted.
+- Messages, edited messages, channel posts, and edited channel posts are accepted.
+- In private chats every text message is converted. In groups, supergroups, and
+  channels the bot responds to `/md <markdown>`, to an @mention, or to a reply
+  to one of its messages. `/md` is the only form that survives Telegram's
+  default privacy mode.
+- Only the addressing prefix is removed from a group message; the document that
+  follows reaches the converter unchanged, so a group and a private chat render
+  the same input identically.
+- Every inbound update is logged with its chat type, entities, and text, and
+  ignored group messages say why, so delivery problems are visible in the log.
 - Nested blockquotes are flattened to one level, since Telegram cannot nest them.
 - Links and images with relative or non-HTTP destinations become plain text,
   because the Bot API rejects them as link targets.
@@ -218,6 +227,52 @@ go run .
 ```
 
 Then message your bot on Telegram — try `/start`, or paste some markdown.
+
+### Groups and channels
+
+1. Add the bot to the group or channel (for channels it must be an
+   administrator with permission to post messages).
+2. Send the markdown after a `/md` command, on the same message:
+
+   ```
+   /md@YourBot # Title
+   **hello** and `code`
+   ```
+
+   `/convert` and `/markdown` are aliases. The markdown may span many lines.
+
+Group and channel messages go through exactly the same pipeline as a private
+chat. Only the addressing prefix is removed — the `/md` command or an @mention
+on the message's first or last line — and the document after it is passed to the
+converter byte for byte, so indentation, blank lines, and code blocks parse
+identically. An @mention in the middle of the document is content, not
+addressing, and is left in place.
+
+Put the command on its own line when the document starts with an indented code
+block. On a single line the space after `/md` cannot be told apart from that
+indentation:
+
+```
+/md@YourBot
+    indented code block
+```
+
+Use the command form in groups. New bots have **privacy mode enabled** by
+default, and Telegram then delivers only commands, replies to the bot, and
+service messages — a plain `@YourBot` mention usually never reaches the bot at
+all, so it cannot answer it.
+
+To make plain mentions and ordinary messages work:
+
+1. Message @BotFather, `/setprivacy`, pick the bot, choose **Disable**.
+2. Remove the bot from the group and add it again — the privacy setting is
+   applied when the bot joins, so existing memberships keep the old behavior.
+
+Replying to one of the bot's own messages works either way.
+
+If a group message is ignored, the log line says so explicitly, including the
+chat type and the text that arrived. If nothing is logged at all, Telegram never
+delivered the update, which means privacy mode is still on.
 
 ## 3. Build a binary
 
