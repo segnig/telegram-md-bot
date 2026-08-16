@@ -1,6 +1,7 @@
 package converter
 
 import (
+	"encoding/base64"
 	"strings"
 	"testing"
 )
@@ -149,6 +150,55 @@ func TestWindowsLineEndings(t *testing.T) {
 	}
 }
 
+func TestDeeplyNestedListsKeepIndentation(t *testing.T) {
+	md := "- top\n  - second\n    - third\n      1. fourth\n"
+	want := "• top\n  • second\n    • third\n      1\\. fourth"
+	if got := Convert(md); got != want {
+		t.Errorf("got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestFencedCodeInsideListItemIsKept(t *testing.T) {
+	md := "- item with fence\n\n  ```go\n  fmt.Println(1)\n  ```\n"
+	got := Convert(md)
+	if !strings.Contains(got, "fmt.Println(1)") {
+		t.Fatalf("code content dropped, got %q", got)
+	}
+	// A fence indented by the list would not be parsed by Telegram.
+	if !strings.Contains(got, "\n```go\n") {
+		t.Errorf("fence is not at column zero, got %q", got)
+	}
+}
+
+func TestTableInsideListItemIsNotIndented(t *testing.T) {
+	md := "- item with table\n\n  | a | b |\n  |---|---|\n  | 1 | 2 |\n"
+	got := Convert(md)
+	for _, line := range strings.Split(got, "\n") {
+		if strings.HasSuffix(strings.TrimSpace(line), "```") && strings.HasPrefix(line, " ") {
+			t.Errorf("indented fence would break parsing: %q", got)
+		}
+	}
+	if !strings.Contains(got, "a | b") {
+		t.Errorf("table content missing, got %q", got)
+	}
+}
+
+func TestListItemContinuationKeepsIndent(t *testing.T) {
+	md := "- item\n\n  continuation paragraph\n"
+	want := "• item\n  continuation paragraph"
+	if got := Convert(md); got != want {
+		t.Errorf("got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestListInsideBlockquoteKeepsIndent(t *testing.T) {
+	md := "> quote\n>\n> - alpha\n>   - beta\n"
+	got := Convert(md)
+	if !strings.Contains(got, "> • alpha") || !strings.Contains(got, ">   • beta") {
+		t.Errorf("quoted list indentation lost, got %q", got)
+	}
+}
+
 func TestNestedBlockquoteFlattened(t *testing.T) {
 	got := Convert("> outer\n>\n>> inner")
 	for _, line := range strings.Split(got, "\n") {
@@ -191,6 +241,61 @@ func TestIsLinkableURL(t *testing.T) {
 		if IsLinkableURL(u) {
 			t.Errorf("IsLinkableURL(%q) = true, want false", u)
 		}
+	}
+}
+
+func TestExtractMermaidFromFence(t *testing.T) {
+	md := "text\n\n```mermaid\ngraph TD\nA-->B\n```\n\n```go\nfmt.Println(1)\n```"
+	got := ExtractMermaid(md)
+	if len(got) != 1 {
+		t.Fatalf("got %d diagrams, want 1: %#v", len(got), got)
+	}
+	if got[0] != "graph TD\nA-->B" {
+		t.Errorf("unexpected diagram: %q", got[0])
+	}
+}
+
+func TestExtractMermaidFromUnfencedParagraph(t *testing.T) {
+	md := "## Mermaid diagrams\n\ngraph TD\nA[Start] --> B{Decision}\nB -->|Yes| C[Finish]"
+	got := ExtractMermaid(md)
+	if len(got) != 1 {
+		t.Fatalf("got %d diagrams, want 1: %#v", len(got), got)
+	}
+	if !strings.HasPrefix(got[0], "graph TD") || !strings.Contains(got[0], "B -->|Yes| C[Finish]") {
+		t.Errorf("unexpected diagram: %q", got[0])
+	}
+}
+
+func TestExtractMermaidIgnoresProse(t *testing.T) {
+	md := "This paragraph mentions graph theory and pie charts.\n\nsequenceDiagramming is a hobby."
+	if got := ExtractMermaid(md); len(got) != 0 {
+		t.Errorf("expected no diagrams, got %#v", got)
+	}
+}
+
+func TestMermaidImageURL(t *testing.T) {
+	diagram := "graph TD\nA[Start] --> B{Decision}"
+	got := MermaidImageURL("", diagram)
+	if !strings.HasPrefix(got, DefaultMermaidEndpoint) {
+		t.Fatalf("unexpected endpoint in %q", got)
+	}
+	encoded := strings.TrimPrefix(got, DefaultMermaidEndpoint)
+	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatalf("payload is not base64url: %v", err)
+	}
+	if string(decoded) != diagram {
+		t.Errorf("decoded = %q, want %q", decoded, diagram)
+	}
+	if strings.ContainsAny(encoded, "+/=") {
+		t.Errorf("encoded payload is not URL-safe: %q", encoded)
+	}
+}
+
+func TestMermaidImageURLCustomEndpoint(t *testing.T) {
+	got := MermaidImageURL("https://mermaid.example.com/img", "graph TD\nA-->B")
+	if !strings.HasPrefix(got, "https://mermaid.example.com/img/") {
+		t.Errorf("unexpected URL: %q", got)
 	}
 }
 

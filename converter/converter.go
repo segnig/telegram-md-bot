@@ -2,8 +2,10 @@
 package converter
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net/url"
+	"regexp"
 	"strings"
 	"unicode/utf8"
 
@@ -34,6 +36,60 @@ func Convert(md string) string {
 	doc := markdown.Parser().Parse(text.NewReader(source))
 	r := renderer{source: source}
 	return strings.TrimRight(r.renderBlocks(doc.FirstChild(), 0), "\n")
+}
+
+// DefaultMermaidEndpoint renders a Mermaid diagram to an image from a
+// base64url-encoded diagram source appended to the path.
+const DefaultMermaidEndpoint = "https://mermaid.ink/img/"
+
+// mermaidHeaderRe matches the first line of an unfenced Mermaid diagram, so
+// diagrams pasted without a ```mermaid fence are still detected.
+var mermaidHeaderRe = regexp.MustCompile(`^(?:(?:graph|flowchart)\s+(?:TB|TD|BT|RL|LR)\b|` +
+	`(?:sequenceDiagram|classDiagram(?:-v2)?|stateDiagram(?:-v2)?|erDiagram|journey|gantt|pie|` +
+	`gitGraph|mindmap|timeline|quadrantChart|requirementDiagram|C4Context|sankey-beta|xychart-beta|block-beta)\b)`)
+
+// ExtractMermaid returns Mermaid diagram sources in document order, from
+// ```mermaid fences and from paragraphs that begin with a Mermaid diagram
+// declaration.
+func ExtractMermaid(md string) []string {
+	source := []byte(strings.ReplaceAll(md, "\r\n", "\n"))
+	doc := markdown.Parser().Parse(text.NewReader(source))
+	var diagrams []string
+	_ = ast.Walk(doc, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
+		if !entering {
+			return ast.WalkContinue, nil
+		}
+		switch n := n.(type) {
+		case *ast.FencedCodeBlock:
+			if !strings.EqualFold(strings.TrimSpace(string(n.Language(source))), "mermaid") {
+				return ast.WalkSkipChildren, nil
+			}
+			if diagram := strings.TrimSpace(segmentsText(n.Lines(), source)); diagram != "" {
+				diagrams = append(diagrams, diagram)
+			}
+			return ast.WalkSkipChildren, nil
+		case *ast.Paragraph:
+			diagram := strings.TrimSpace(segmentsText(n.Lines(), source))
+			if diagram != "" && mermaidHeaderRe.MatchString(diagram) {
+				diagrams = append(diagrams, diagram)
+			}
+			return ast.WalkSkipChildren, nil
+		}
+		return ast.WalkContinue, nil
+	})
+	return diagrams
+}
+
+// MermaidImageURL builds a rendering URL for a Mermaid diagram. An empty
+// endpoint falls back to DefaultMermaidEndpoint.
+func MermaidImageURL(endpoint, diagram string) string {
+	if endpoint == "" {
+		endpoint = DefaultMermaidEndpoint
+	}
+	if !strings.HasSuffix(endpoint, "/") {
+		endpoint += "/"
+	}
+	return endpoint + base64.RawURLEncoding.EncodeToString([]byte(strings.TrimSpace(diagram)))
 }
 
 // ExtractImages returns markdown images that Telegram can fetch by URL, in
@@ -75,55 +131,63 @@ type renderer struct {
 func (r renderer) renderBlocks(node ast.Node, depth int) string {
 	var out strings.Builder
 	for n := node; n != nil; n = n.NextSibling() {
-		switch n := n.(type) {
-		case *ast.Heading:
-			out.WriteString("*")
-			out.WriteString(r.renderInlineChildren(n))
-			out.WriteString("*\n\n")
-		case *ast.Paragraph, *ast.TextBlock:
-			out.WriteString(r.renderInlineChildren(n))
-			out.WriteString("\n\n")
-		case *ast.Blockquote:
-			content := strings.TrimSpace(r.renderBlocks(n.FirstChild(), depth))
-			for _, line := range strings.Split(content, "\n") {
-				switch {
-				case line == "":
-					out.WriteString(">\n")
-				// Telegram has no nested blockquotes, and a second literal ">"
-				// would need escaping, so nested levels are flattened.
-				case strings.HasPrefix(line, ">"):
-					out.WriteString(line)
-					out.WriteByte('\n')
-				default:
-					out.WriteString("> ")
-					out.WriteString(line)
-					out.WriteByte('\n')
-				}
-			}
-			out.WriteByte('\n')
-		case *ast.List:
-			out.WriteString(r.renderList(n, depth))
-			if depth == 0 {
+		out.WriteString(r.renderBlock(n, depth))
+	}
+	return out.String()
+}
+
+// renderBlock renders a single block node, ignoring its siblings, so nested
+// content such as a code block inside a list item can be rendered in place.
+func (r renderer) renderBlock(node ast.Node, depth int) string {
+	var out strings.Builder
+	switch n := node.(type) {
+	case *ast.Heading:
+		out.WriteString("*")
+		out.WriteString(r.renderInlineChildren(n))
+		out.WriteString("*\n\n")
+	case *ast.Paragraph, *ast.TextBlock:
+		out.WriteString(r.renderInlineChildren(n))
+		out.WriteString("\n\n")
+	case *ast.Blockquote:
+		content := strings.TrimSpace(r.renderBlocks(n.FirstChild(), depth))
+		for _, line := range strings.Split(content, "\n") {
+			switch {
+			case line == "":
+				out.WriteString(">\n")
+			// Telegram has no nested blockquotes, and a second literal ">"
+			// would need escaping, so nested levels are flattened.
+			case strings.HasPrefix(line, ">"):
+				out.WriteString(line)
+				out.WriteByte('\n')
+			default:
+				out.WriteString("> ")
+				out.WriteString(line)
 				out.WriteByte('\n')
 			}
-		case *ast.FencedCodeBlock:
-			out.WriteString(r.renderFencedCode(n))
-			out.WriteString("\n\n")
-		case *ast.CodeBlock:
-			out.WriteString(r.renderCodeLines(n.Lines()))
-			out.WriteString("\n\n")
-		case *ast.ThematicBreak:
-			out.WriteString("──────────\n\n")
-		case *extensionast.Table:
-			out.WriteString(r.renderTable(n))
-			out.WriteString("\n\n")
-		case *ast.HTMLBlock:
-			out.WriteString(escapeText(r.blockLines(n.Lines())))
-			out.WriteString("\n\n")
-		default:
-			if n.HasChildren() {
-				out.WriteString(r.renderBlocks(n.FirstChild(), depth))
-			}
+		}
+		out.WriteByte('\n')
+	case *ast.List:
+		out.WriteString(r.renderList(n, depth))
+		if depth == 0 {
+			out.WriteByte('\n')
+		}
+	case *ast.FencedCodeBlock:
+		out.WriteString(r.renderFencedCode(n))
+		out.WriteString("\n\n")
+	case *ast.CodeBlock:
+		out.WriteString(r.renderCodeLines(n.Lines()))
+		out.WriteString("\n\n")
+	case *ast.ThematicBreak:
+		out.WriteString("──────────\n\n")
+	case *extensionast.Table:
+		out.WriteString(r.renderTable(n))
+		out.WriteString("\n\n")
+	case *ast.HTMLBlock:
+		out.WriteString(escapeText(r.blockLines(n.Lines())))
+		out.WriteString("\n\n")
+	default:
+		if n.HasChildren() {
+			out.WriteString(r.renderBlocks(n.FirstChild(), depth))
 		}
 	}
 	return out.String()
@@ -155,8 +219,20 @@ func (r renderer) renderList(list *ast.List, depth int) string {
 				first = false
 				continue
 			}
-			content := strings.TrimSpace(r.renderBlockNode(child, depth+1))
+			content := strings.TrimSpace(r.renderBlock(child, depth+1))
 			if content == "" {
+				continue
+			}
+			// Telegram only recognizes a code fence at the start of a line, so
+			// fenced content (code blocks and tables) keeps column zero instead
+			// of following the item indent.
+			if strings.HasPrefix(content, "```") {
+				if first {
+					out.WriteByte('\n')
+				}
+				out.WriteString(content)
+				out.WriteByte('\n')
+				first = false
 				continue
 			}
 			if !first {
@@ -172,20 +248,6 @@ func (r renderer) renderList(list *ast.List, depth int) string {
 		}
 	}
 	return out.String()
-}
-
-func (r renderer) renderBlockNode(n ast.Node, depth int) string {
-	switch n := n.(type) {
-	case *ast.Paragraph, *ast.TextBlock:
-		return r.renderInlineChildren(n)
-	case *ast.Blockquote:
-		return strings.TrimSpace(r.renderBlocks(n, depth))
-	default:
-		if n.HasChildren() {
-			return strings.TrimSpace(r.renderBlocks(n.FirstChild(), depth))
-		}
-	}
-	return ""
 }
 
 func (r renderer) renderInlineChildren(parent ast.Node) string {
@@ -258,10 +320,14 @@ func (r renderer) renderCodeLines(lines *text.Segments) string {
 }
 
 func (r renderer) blockLines(lines *text.Segments) string {
+	return segmentsText(lines, r.source)
+}
+
+func segmentsText(lines *text.Segments, source []byte) string {
 	var out strings.Builder
 	for i := 0; i < lines.Len(); i++ {
 		segment := lines.At(i)
-		out.Write(segment.Value(r.source))
+		out.Write(segment.Value(source))
 	}
 	return out.String()
 }

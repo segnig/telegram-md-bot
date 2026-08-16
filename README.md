@@ -2,13 +2,15 @@
 
 A Telegram bot, written in Go, that converts CommonMark and
 GitHub-Flavored Markdown into
-Telegram's **MarkdownV2** formatting. Send it any markdown and it replies
-with:
+Telegram's **MarkdownV2** formatting.
 
-1. a live preview of how the text will render in Telegram,
-2. photo previews for any `![alt](url)` images (via `sendPhoto`), and
-3. the raw converted MarkdownV2 source as copyable plain text, ready to
-   paste into your own bot's `sendMessage` calls.
+The bot answers with a **single message** per request. Markdown images and
+Mermaid diagrams are downloaded and uploaded to Telegram as real
+attachments, and the converted MarkdownV2 becomes the caption of that same
+message, so everything shares one message.
+
+When a request has no images, the reply is one text message with only the
+rendered preview.
 
 The converter uses [goldmark](https://github.com/yuin/goldmark), a
 CommonMark-compliant parser, instead of regular-expression parsing. The
@@ -28,9 +30,10 @@ Telegram API client itself uses only the Go standard library.
 | `- [x] task`             | `• ☑ task`                                            |
 | `> quote`                | `> quote` (Telegram's native blockquote entity)      |
 | `[text](url)`            | `[text](url)`, with escaping inside                  |
-| `![alt](url)`            | `[📷 alt](url)` in text, plus `sendPhoto` preview    |
+| `![alt](url)`            | `[📷 alt](url)` in text, plus an uploaded attachment  |
 | `---` / `***` / `___`    | a plain `──────────` divider line                    |
 | pipe tables              | a monospaced, column-aligned block (no native tables)|
+| Mermaid diagrams         | rendered to an image and uploaded as an attachment    |
 
 All literal punctuation that MarkdownV2 treats as special
 (`_ * [ ] ( ) ~ \` > # + - = | { } . !` and `\`) is automatically
@@ -39,9 +42,50 @@ backslash-escaped in plain text, per Telegram's spec.
 Nested and mixed emphasis is parsed recursively, and GFM task lists and
 tables are supported.
 
+### Indentation and nesting
+
+Nested list structure is preserved: each level is indented by two spaces, and
+mixed ordered/unordered nesting keeps its shape. Paragraphs that continue a
+list item stay aligned under that item, and lists inside blockquotes keep
+their indentation behind the `>` marker.
+
+Code blocks and tables nested inside a list item are emitted at column zero,
+because Telegram only recognizes a ``` fence at the start of a line.
+
+### Mermaid diagrams
+
+Mermaid diagrams are detected in two forms: fenced blocks tagged
+` ```mermaid `, and unfenced paragraphs that start with a diagram
+declaration such as `graph TD`, `sequenceDiagram`, or `gantt`.
+
+Each diagram is base64url-encoded into a rendering URL, downloaded, and
+uploaded to Telegram as an attachment. Rendering uses the public
+[mermaid.ink](https://mermaid.ink) service by default, which means diagram
+source leaves your machine. Point `MERMAID_ENDPOINT` at a self-hosted
+renderer to avoid that:
+
+```bash
+export MERMAID_ENDPOINT="https://mermaid.internal.example.com/img/"
+```
+
+A diagram that fails to render is skipped and logged; the rest of the reply
+is still delivered.
+
+### One message per reply
+
+Telegram imposes limits that shape this behavior:
+
+- A caption may hold 1024 characters, while a text message may hold 4096.
+  If the converted markdown exceeds the caption limit, it is sent as a
+  follow-up message, because it cannot fit alongside the attachments.
+- A single image uses `sendPhoto`, which is genuinely one message. Several
+  images use `sendMediaGroup`, which Telegram delivers as one album.
+- Up to 10 images are attached per reply, each at most 10 MB.
+- SVG images are skipped, since the Bot API rejects them as photos.
+
 ### Reliability behavior
 
-- Long input is split at paragraph boundaries before conversion.
+- Telegram API and image downloads honor request cancellation.
 - Telegram rate limits (`retry_after`) are honored and retried once.
 - Polling failures use bounded exponential backoff.
 - `SIGINT` and `SIGTERM` cancel in-flight HTTP requests and shut down cleanly.

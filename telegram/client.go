@@ -9,9 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -22,10 +24,23 @@ type Bot struct {
 	apiBase string
 }
 
+// DefaultAPIBase is Telegram's hosted Bot API.
+const DefaultAPIBase = "https://api.telegram.org"
+
 func New(token string) *Bot {
+	return NewWithAPIBase(DefaultAPIBase, token)
+}
+
+// NewWithAPIBase targets a specific Bot API host, such as a local Bot API
+// server.
+func NewWithAPIBase(apiBase, token string) *Bot {
+	apiBase = strings.TrimSuffix(strings.TrimSpace(apiBase), "/")
+	if apiBase == "" {
+		apiBase = DefaultAPIBase
+	}
 	return &Bot{
 		client:  &http.Client{Timeout: 70 * time.Second},
-		apiBase: "https://api.telegram.org/bot" + token,
+		apiBase: apiBase + "/bot" + token,
 	}
 }
 
@@ -124,25 +139,114 @@ func (b *Bot) SendMessage(ctx context.Context, chatID int64, text, parseMode str
 	return b.call(ctx, http.MethodPost, "/sendMessage", body, &sent)
 }
 
-// SendPhoto sends a photo by public HTTP(S) URL. caption is optional plain text.
-func (b *Bot) SendPhoto(ctx context.Context, chatID int64, photoURL, caption string) error {
-	payload := map[string]any{
-		"chat_id": chatID,
-		"photo":   photoURL,
-	}
+// InputPhoto is image data uploaded to Telegram as a real attachment rather
+// than referenced by URL.
+type InputPhoto struct {
+	Filename string
+	Data     []byte
+}
+
+// SendPhoto uploads a single photo with an optional caption, producing one
+// message.
+func (b *Bot) SendPhoto(ctx context.Context, chatID int64, photo InputPhoto, caption, parseMode string) error {
+	var body bytes.Buffer
+	form := multipart.NewWriter(&body)
+
+	fields := map[string]string{"chat_id": strconv.FormatInt(chatID, 10)}
 	if caption != "" {
-		payload["caption"] = caption
+		fields["caption"] = caption
 	}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("encode sendPhoto request: %w", err)
+	if parseMode != "" {
+		fields["parse_mode"] = parseMode
+	}
+	for name, value := range fields {
+		if err := form.WriteField(name, value); err != nil {
+			return fmt.Errorf("write sendPhoto field %q: %w", name, err)
+		}
+	}
+	if err := writeFile(form, "photo", photo); err != nil {
+		return err
+	}
+	if err := form.Close(); err != nil {
+		return fmt.Errorf("finalize sendPhoto form: %w", err)
 	}
 
 	var sent Message
-	return b.call(ctx, http.MethodPost, "/sendPhoto", body, &sent)
+	return b.upload(ctx, "/sendPhoto", form.FormDataContentType(), body.Bytes(), &sent)
+}
+
+// SendMediaGroup uploads several photos as one album. Telegram attaches the
+// caption to the album by placing it on the first item.
+func (b *Bot) SendMediaGroup(ctx context.Context, chatID int64, photos []InputPhoto, caption, parseMode string) error {
+	if len(photos) == 0 {
+		return errors.New("sendMediaGroup requires at least one photo")
+	}
+
+	var body bytes.Buffer
+	form := multipart.NewWriter(&body)
+
+	media := make([]map[string]any, 0, len(photos))
+	for i, photo := range photos {
+		field := "file" + strconv.Itoa(i)
+		item := map[string]any{"type": "photo", "media": "attach://" + field}
+		if i == 0 && caption != "" {
+			item["caption"] = caption
+			if parseMode != "" {
+				item["parse_mode"] = parseMode
+			}
+		}
+		media = append(media, item)
+		if err := writeFile(form, field, photo); err != nil {
+			return err
+		}
+	}
+
+	encodedMedia, err := json.Marshal(media)
+	if err != nil {
+		return fmt.Errorf("encode sendMediaGroup media: %w", err)
+	}
+	if err := form.WriteField("chat_id", strconv.FormatInt(chatID, 10)); err != nil {
+		return fmt.Errorf("write sendMediaGroup chat_id: %w", err)
+	}
+	if err := form.WriteField("media", string(encodedMedia)); err != nil {
+		return fmt.Errorf("write sendMediaGroup media: %w", err)
+	}
+	if err := form.Close(); err != nil {
+		return fmt.Errorf("finalize sendMediaGroup form: %w", err)
+	}
+
+	var sent []Message
+	return b.upload(ctx, "/sendMediaGroup", form.FormDataContentType(), body.Bytes(), &sent)
+}
+
+func writeFile(form *multipart.Writer, field string, photo InputPhoto) error {
+	filename := photo.Filename
+	if filename == "" {
+		filename = field + ".jpg"
+	}
+	part, err := form.CreateFormFile(field, filename)
+	if err != nil {
+		return fmt.Errorf("create form file %q: %w", field, err)
+	}
+	if _, err := part.Write(photo.Data); err != nil {
+		return fmt.Errorf("write form file %q: %w", field, err)
+	}
+	return nil
 }
 
 func (b *Bot) call(ctx context.Context, method, path string, payload []byte, result any) error {
+	contentType := ""
+	if payload != nil {
+		contentType = "application/json"
+	}
+	return b.do(ctx, method, path, contentType, payload, result)
+}
+
+func (b *Bot) upload(ctx context.Context, path, contentType string, payload []byte, result any) error {
+	return b.do(ctx, http.MethodPost, path, contentType, payload, result)
+}
+
+func (b *Bot) do(ctx context.Context, method, path, contentType string, payload []byte, result any) error {
 	var body io.Reader
 	if payload != nil {
 		body = bytes.NewReader(payload)
@@ -151,8 +255,8 @@ func (b *Bot) call(ctx context.Context, method, path string, payload []byte, res
 	if err != nil {
 		return fmt.Errorf("create Telegram request: %w", err)
 	}
-	if payload != nil {
-		req.Header.Set("Content-Type", "application/json")
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
 	}
 
 	resp, err := b.client.Do(req)
