@@ -109,6 +109,12 @@ func startHealthServer(ctx context.Context) {
 }
 
 func run(ctx context.Context, bot *telegram.Bot) error {
+	// A leftover webhook (from another host or earlier experiment) blocks
+	// getUpdates completely, so clear it before polling.
+	if err := bot.DeleteWebhook(ctx); err != nil {
+		log.Printf("deleteWebhook warning: %v (continuing)", err)
+	}
+
 	me, err := bot.GetMe(ctx)
 	if err != nil {
 		return fmt.Errorf("getMe: %w", err)
