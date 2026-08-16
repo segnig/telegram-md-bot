@@ -148,3 +148,69 @@ func TestWindowsLineEndings(t *testing.T) {
 		t.Errorf("got %q want %q", got, want)
 	}
 }
+
+func TestNestedBlockquoteFlattened(t *testing.T) {
+	got := Convert("> outer\n>\n>> inner")
+	for _, line := range strings.Split(got, "\n") {
+		if strings.HasPrefix(line, "> >") || strings.HasPrefix(line, ">>") {
+			t.Fatalf("nested blockquote marker left unescaped: %q", got)
+		}
+	}
+	if !strings.Contains(got, "> inner") {
+		t.Errorf("inner quote content missing, got %q", got)
+	}
+}
+
+func TestRelativeImageBecomesPlainText(t *testing.T) {
+	got := Convert(`![This is an alt text.](/image/Markdown-mark.svg "sample")`)
+	if strings.Contains(got, "](") {
+		t.Fatalf("relative destination must not become a link, got %q", got)
+	}
+	if !strings.Contains(got, "📷 This is an alt text") {
+		t.Errorf("alt text missing, got %q", got)
+	}
+}
+
+func TestAbsoluteLinkStillRendered(t *testing.T) {
+	got := Convert("[site](https://markdownlivepreview.com/)")
+	want := "[site](https://markdownlivepreview.com/)"
+	if got != want {
+		t.Errorf("got %q want %q", got, want)
+	}
+}
+
+func TestIsLinkableURL(t *testing.T) {
+	linkable := []string{"https://example.com", "http://example.com/a?b=1", "tg://user?id=1"}
+	for _, u := range linkable {
+		if !IsLinkableURL(u) {
+			t.Errorf("IsLinkableURL(%q) = false, want true", u)
+		}
+	}
+	rejected := []string{"/image/logo.svg", "image.png", "", "ftp://example.com", "https://"}
+	for _, u := range rejected {
+		if IsLinkableURL(u) {
+			t.Errorf("IsLinkableURL(%q) = true, want false", u)
+		}
+	}
+}
+
+func TestExtractImagesSkipsRelativeURLs(t *testing.T) {
+	got := ExtractImages("![a](/image/logo.svg)\n\n![b](https://example.com/b.png)")
+	if len(got) != 1 || got[0].URL != "https://example.com/b.png" {
+		t.Fatalf("unexpected images: %#v", got)
+	}
+}
+
+func TestExtractImages(t *testing.T) {
+	md := "Intro\n\n![logo](https://example.com/logo.png)\n\nand ![ ](https://cdn.example.com/a.jpg)"
+	got := ExtractImages(md)
+	if len(got) != 2 {
+		t.Fatalf("got %d images, want 2: %#v", len(got), got)
+	}
+	if got[0].Alt != "logo" || got[0].URL != "https://example.com/logo.png" {
+		t.Errorf("first image = %#v", got[0])
+	}
+	if got[1].Alt != "image" || got[1].URL != "https://cdn.example.com/a.jpg" {
+		t.Errorf("second image = %#v", got[1])
+	}
+}

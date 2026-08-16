@@ -124,6 +124,24 @@ func (b *Bot) SendMessage(ctx context.Context, chatID int64, text, parseMode str
 	return b.call(ctx, http.MethodPost, "/sendMessage", body, &sent)
 }
 
+// SendPhoto sends a photo by public HTTP(S) URL. caption is optional plain text.
+func (b *Bot) SendPhoto(ctx context.Context, chatID int64, photoURL, caption string) error {
+	payload := map[string]any{
+		"chat_id": chatID,
+		"photo":   photoURL,
+	}
+	if caption != "" {
+		payload["caption"] = caption
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("encode sendPhoto request: %w", err)
+	}
+
+	var sent Message
+	return b.call(ctx, http.MethodPost, "/sendPhoto", body, &sent)
+}
+
 func (b *Bot) call(ctx context.Context, method, path string, payload []byte, result any) error {
 	var body io.Reader
 	if payload != nil {

@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"os"
 	"os/signal"
@@ -23,6 +24,7 @@ const (
 
 const welcomeText = "Send me CommonMark or GitHub-Flavored Markdown and I'll convert it to Telegram MarkdownV2.\n\n" +
 	"Supported features include nested emphasis, links, images, task lists, blockquotes, fenced code, and tables. " +
+	"Markdown images (![](url)) are also sent as photo previews via sendPhoto. " +
 	"Long messages are split into safe-sized parts automatically."
 
 func main() {
@@ -90,16 +92,27 @@ func handleMessage(ctx context.Context, bot *telegram.Bot, message *telegram.Mes
 	parts := splitMarkdown(message.Text, maxSourceChunk)
 	for index, part := range parts {
 		converted := converter.Convert(part)
-		if converted == "" {
+		images := converter.ExtractImages(part)
+		if converted == "" && len(images) == 0 {
 			continue
 		}
 
-		if err := sendWithRetry(ctx, bot, message.Chat.ID, converted, "MarkdownV2"); err != nil {
-			log.Printf("preview part %d/%d failed: %v", index+1, len(parts), err)
-			fallback := "Preview could not be rendered; the MarkdownV2 source follows."
-			_ = sendWithRetry(ctx, bot, message.Chat.ID, fallback, "")
+		if converted != "" {
+			if err := sendWithRetry(ctx, bot, message.Chat.ID, converted, "MarkdownV2"); err != nil {
+				log.Printf("preview part %d/%d failed: %v", index+1, len(parts), err)
+				_ = sendWithRetry(ctx, bot, message.Chat.ID, previewFallbackText(err), "")
+			}
 		}
 
+		for _, image := range images {
+			if err := sendPhotoWithRetry(ctx, bot, message.Chat.ID, image.URL, image.Alt); err != nil {
+				log.Printf("sendPhoto failed for %q: %v", image.URL, err)
+			}
+		}
+
+		if converted == "" {
+			continue
+		}
 		label := "MarkdownV2 source"
 		if len(parts) > 1 {
 			label += " (part " + itoa(index+1) + "/" + itoa(len(parts)) + ")"
@@ -114,6 +127,14 @@ func handleMessage(ctx context.Context, bot *telegram.Bot, message *telegram.Mes
 	}
 }
 
+func previewFallbackText(err error) string {
+	var apiErr *telegram.APIError
+	if errors.As(err, &apiErr) && apiErr.Description != "" {
+		return "Preview could not be rendered (Telegram said: " + apiErr.Description + "); the MarkdownV2 source follows."
+	}
+	return "Preview could not be rendered; the MarkdownV2 source follows."
+}
+
 func sendWithRetry(ctx context.Context, bot *telegram.Bot, chatID int64, text, parseMode string) error {
 	err := bot.SendMessage(ctx, chatID, text, parseMode)
 	delay, ok := telegram.RetryDelay(err)
@@ -124,6 +145,18 @@ func sendWithRetry(ctx context.Context, bot *telegram.Bot, chatID int64, text, p
 		return err
 	}
 	return bot.SendMessage(ctx, chatID, text, parseMode)
+}
+
+func sendPhotoWithRetry(ctx context.Context, bot *telegram.Bot, chatID int64, photoURL, caption string) error {
+	err := bot.SendPhoto(ctx, chatID, photoURL, caption)
+	delay, ok := telegram.RetryDelay(err)
+	if !ok {
+		return err
+	}
+	if err := sleepContext(ctx, delay); err != nil {
+		return err
+	}
+	return bot.SendPhoto(ctx, chatID, photoURL, caption)
 }
 
 func isCommand(text, command string) bool {

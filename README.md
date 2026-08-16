@@ -5,8 +5,9 @@ GitHub-Flavored Markdown into
 Telegram's **MarkdownV2** formatting. Send it any markdown and it replies
 with:
 
-1. a live preview of how the text will render in Telegram, and
-2. the raw converted MarkdownV2 source as copyable plain text, ready to
+1. a live preview of how the text will render in Telegram,
+2. photo previews for any `![alt](url)` images (via `sendPhoto`), and
+3. the raw converted MarkdownV2 source as copyable plain text, ready to
    paste into your own bot's `sendMessage` calls.
 
 The converter uses [goldmark](https://github.com/yuin/goldmark), a
@@ -27,7 +28,7 @@ Telegram API client itself uses only the Go standard library.
 | `- [x] task`             | `• ☑ task`                                            |
 | `> quote`                | `> quote` (Telegram's native blockquote entity)      |
 | `[text](url)`            | `[text](url)`, with escaping inside                  |
-| `![alt](url)`            | `[📷 alt](url)` (Telegram has no inline images)      |
+| `![alt](url)`            | `[📷 alt](url)` in text, plus `sendPhoto` preview    |
 | `---` / `***` / `___`    | a plain `──────────` divider line                    |
 | pipe tables              | a monospaced, column-aligned block (no native tables)|
 
@@ -45,6 +46,9 @@ tables are supported.
 - Polling failures use bounded exponential backoff.
 - `SIGINT` and `SIGTERM` cancel in-flight HTTP requests and shut down cleanly.
 - Messages, edited messages, and channel posts are accepted.
+- Nested blockquotes are flattened to one level, since Telegram cannot nest them.
+- Links and images with relative or non-HTTP destinations become plain text,
+  because the Bot API rejects them as link targets.
 - Telegram API errors are returned as typed errors with their error code and
   retry delay.
 

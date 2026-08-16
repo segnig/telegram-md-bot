@@ -3,6 +3,7 @@ package converter
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 	"unicode/utf8"
 
@@ -21,12 +22,50 @@ var markdown = goldmark.New(
 	goldmark.WithParserOptions(parser.WithAutoHeadingID()),
 )
 
+// Image is a markdown image found while parsing input.
+type Image struct {
+	Alt string
+	URL string
+}
+
 // Convert transforms CommonMark/GFM input into Telegram MarkdownV2-ready text.
 func Convert(md string) string {
 	source := []byte(strings.ReplaceAll(md, "\r\n", "\n"))
 	doc := markdown.Parser().Parse(text.NewReader(source))
 	r := renderer{source: source}
 	return strings.TrimRight(r.renderBlocks(doc.FirstChild(), 0), "\n")
+}
+
+// ExtractImages returns markdown images that Telegram can fetch by URL, in
+// document order. Relative or non-HTTP destinations are skipped because
+// sendPhoto only accepts a public HTTP(S) URL or an uploaded file.
+func ExtractImages(md string) []Image {
+	source := []byte(strings.ReplaceAll(md, "\r\n", "\n"))
+	doc := markdown.Parser().Parse(text.NewReader(source))
+	var images []Image
+	_ = ast.Walk(doc, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
+		if !entering {
+			return ast.WalkContinue, nil
+		}
+		img, ok := n.(*ast.Image)
+		if !ok {
+			return ast.WalkContinue, nil
+		}
+		destination := strings.TrimSpace(string(img.Destination))
+		if !strings.HasPrefix(destination, "http://") && !strings.HasPrefix(destination, "https://") {
+			return ast.WalkContinue, nil
+		}
+		if !IsLinkableURL(destination) {
+			return ast.WalkContinue, nil
+		}
+		alt := plainText(img, source)
+		if alt == "" {
+			alt = "image"
+		}
+		images = append(images, Image{Alt: alt, URL: destination})
+		return ast.WalkContinue, nil
+	})
+	return images
 }
 
 type renderer struct {
@@ -47,9 +86,15 @@ func (r renderer) renderBlocks(node ast.Node, depth int) string {
 		case *ast.Blockquote:
 			content := strings.TrimSpace(r.renderBlocks(n.FirstChild(), depth))
 			for _, line := range strings.Split(content, "\n") {
-				if line == "" {
+				switch {
+				case line == "":
 					out.WriteString(">\n")
-				} else {
+				// Telegram has no nested blockquotes, and a second literal ">"
+				// would need escaping, so nested levels are flattened.
+				case strings.HasPrefix(line, ">"):
+					out.WriteString(line)
+					out.WriteByte('\n')
+				default:
 					out.WriteString("> ")
 					out.WriteString(line)
 					out.WriteByte('\n')
@@ -170,16 +215,15 @@ func (r renderer) renderInline(n ast.Node) string {
 	case *ast.CodeSpan:
 		return "`" + escapeCode(string(n.Text(r.source))) + "`"
 	case *ast.Link:
-		return "[" + r.renderInlineChildren(n) + "](" + escapeURL(string(n.Destination)) + ")"
+		return renderLink(r.renderInlineChildren(n), string(n.Destination))
 	case *ast.Image:
 		alt := plainText(n, r.source)
 		if alt == "" {
 			alt = "image"
 		}
-		return "[📷 " + escapeText(alt) + "](" + escapeURL(string(n.Destination)) + ")"
+		return renderLink("📷 "+escapeText(alt), string(n.Destination))
 	case *ast.AutoLink:
-		url := string(n.URL(r.source))
-		return "[" + escapeText(string(n.Label(r.source))) + "](" + escapeURL(url) + ")"
+		return renderLink(escapeText(string(n.Label(r.source))), string(n.URL(r.source)))
 	case *ast.RawHTML:
 		var value strings.Builder
 		for i := 0; i < n.Segments.Len(); i++ {
@@ -311,4 +355,36 @@ func escapeCode(s string) string {
 func escapeURL(s string) string {
 	s = strings.ReplaceAll(s, `\`, `\\`)
 	return strings.ReplaceAll(s, `)`, `\)`)
+}
+
+// IsLinkableURL reports whether Telegram will accept a destination as a link
+// target. Relative paths such as "/image/logo.svg" are rejected by the Bot API,
+// so they are rendered as plain text instead.
+func IsLinkableURL(destination string) bool {
+	destination = strings.TrimSpace(destination)
+	parsed, err := url.Parse(destination)
+	if err != nil {
+		return false
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https":
+		return parsed.Host != ""
+	case "tg":
+		return true
+	default:
+		return false
+	}
+}
+
+// renderLink emits a MarkdownV2 inline link, degrading to plain text when the
+// destination is not a URL Telegram can link to.
+func renderLink(label, destination string) string {
+	destination = strings.TrimSpace(destination)
+	if IsLinkableURL(destination) {
+		return "[" + label + "](" + escapeURL(destination) + ")"
+	}
+	if destination == "" {
+		return label
+	}
+	return label + " \\(" + escapeText(destination) + "\\)"
 }

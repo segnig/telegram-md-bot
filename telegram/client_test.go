@@ -53,6 +53,27 @@ func TestSendMessagePayload(t *testing.T) {
 	}
 }
 
+func TestSendPhotoPayload(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/sendPhoto" {
+			t.Errorf("path = %q, want /sendPhoto", r.URL.Path)
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if payload["photo"] != "https://example.com/a.png" || payload["caption"] != "logo" {
+			t.Errorf("unexpected payload: %#v", payload)
+		}
+		_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":2,"text":"","chat":{"id":99}}}`))
+	}))
+	defer server.Close()
+
+	if err := testBot(server).SendPhoto(context.Background(), 99, "https://example.com/a.png", "logo"); err != nil {
+		t.Fatalf("SendPhoto returned error: %v", err)
+	}
+}
+
 func TestRateLimitErrorExposesRetryDelay(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusTooManyRequests)
